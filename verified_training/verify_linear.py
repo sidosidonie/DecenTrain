@@ -2,7 +2,7 @@ import torch
 from torch.autograd import Function
 from torch.nn import Linear, Module, Parameter
 from torch.nn import functional as F, init
-from verification import time_profile, freivalds_algorithm
+from verified_training.verification import time_profile, freivalds_algorithm
 import time
 import pandas as pd
 import deepspeed
