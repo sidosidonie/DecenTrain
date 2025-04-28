@@ -1,0 +1,19 @@
+{
+    "cpu_only": false,
+    "use_half": true,
+    "bs": 1,
+    "ds_config": null,
+    "num_epochs": 10,
+    "model_path": "meta-llama/Llama-3.2-1B-Instruct",
+    "verify": true,
+    "perf": {
+        "breakdown": {
+            "forward-st-forward-ed": 17.208203529939055,
+            "forward-ed-backward-ed": 4.8673251153280335,
+            "backward-ed-update-ed": 0.00336885131481621
+        },
+        "total": {
+            "st-ed": 22.07889949778716
+        }
+    }
+}

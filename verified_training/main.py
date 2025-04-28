@@ -1,6 +1,15 @@
+import sys
+import os
+
+# Get the absolute path of the current file
+current_file_path = os.path.abspath(__file__)
+current_dir = os.path.dirname(current_file_path)
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+
 import torch
 import torch.nn as nn
-import deepspeed
 
 from torch.nn import Linear 
 from transformers import AutoModelForCausalLM
@@ -117,14 +126,15 @@ from verified_training.llm_model import create_llm_model
 from verified_training.utils.log_utils import g_logger, logging
 import os
 
-def train_one_case(verify, use_ds=True, half=False, cpu_only=True):
-    if cpu_only:
-        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    t = Train(model_name, get_c4_datasets(model_name), verify,
-               10, 1, use_ds, half, cpu_only, "logs/perf-gpu-half.json")
-    t.do()
+def train_one_case(verify, use_ds=True, half=False, cpu_only=True, log="gpu.json"):
+    try:
+        model_name = "meta-llama/Llama-3.2-1B-Instruct"
+        t = Train(model_name, get_c4_datasets(model_name), verify,
+                   10, 1, use_ds, half, cpu_only, log)
+        t.do()
+    except Exception as e:
+        g_logger.error(f"Run {verify=} {use_ds=} {half=} {cpu_only=} {log=} failed with {e}")
+        return 
 
 
 def main(use_ds, use_half):
@@ -137,15 +147,38 @@ def main(use_ds, use_half):
     dataloader = get_c4_datasets(model_name)
     train(model, dataloader, 3, 1, use_ds, use_half)
     LinearWithVerification.perf_log.process()
-    LinearWithVerification.perf_log.to_csv("perf-improve-half.csv")
+    LinearWithVerification.perf_log.to_csv("perf-improve.csv")
 
     if str(device) != "cpu":
         peak_memory = torch.cuda.max_memory_allocated() / 1024**3
         print(f"Peak memory allocated: {peak_memory:.2f} GB")
 
 if __name__ == "__main__":
-    #model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    #main(True, True)
-    train_one_case(True, half=True, cpu_only=False)
+    def _set(v, a, b):
+        if v:
+            return a
+        else:
+            return b
+
+    import sys
+    use_cpu = int(sys.argv[1])
+    if use_cpu == 1:
+        cpu_all = [True]
+    else:
+        cpu_all = [False]
+
+    for cpu in cpu_all:
+        c = _set(cpu, "cpu", "gpu")
+        for verify in [True]:
+            v = _set(verify, "v", "o")
+            for use_ds in [True]:
+                d = _set(use_ds, "ds", "nods")
+                for half in [False]:
+                    h = _set(half, "half", "fp32")
+                    log_file = f"perfs/{v}-{d}-{h}-{c}.json"
+                    print(log_file)
+                    train_one_case(verify, use_ds, half, cpu, log_file)
+
+
     #main(False)
     #eval_model(model_name)
