@@ -10,7 +10,7 @@ def get_c4_datasets(model_path, split="train"):
     def tokenize_function(examples):
         return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=128, return_tensors="pt")
 
-    c4_streamed = load_dataset("/home/ubuntu/data/c4", split=split)
+    c4_streamed = load_dataset("/home/ubuntu/zg/data/c4", split=split)
     column_names = c4_streamed.column_names
 
     tokenized_datasets = c4_streamed.map(tokenize_function, remove_columns=column_names, num_proc=32, load_from_cache_file=True, batched=True)

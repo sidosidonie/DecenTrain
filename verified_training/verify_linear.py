@@ -1,3 +1,12 @@
+import sys
+import os
+
+# Get the absolute path of the current file
+current_file_path = os.path.abspath(__file__)
+current_dir = os.path.dirname(current_file_path)
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
 import torch
 from torch.autograd import Function
 from torch.nn import Linear, Module, Parameter
@@ -71,9 +80,43 @@ class PerfLog:
         print(df)
         df.to_csv(fname)
 
+def top_k_sparsify(grad, kp : float):
+    flat_grad = grad.view(-1)
+    k = int(flat_grad.numel() * kp)
+    _, indices = torch.topk(flat_grad.abs(), k)
+    
+    sparse_grad = torch.zeros_like(flat_grad)
+    sparse_grad[indices] = flat_grad[indices]
+    
+    return sparse_grad.view_as(grad)
+
+def random_k_sparsify(grad, k):
+    flat_grad = grad.view(-1)
+    k = min(k, flat_grad.numel())
+    indices = torch.randperm(flat_grad.numel())[:k]
+    
+    sparse_grad = torch.zeros_like(flat_grad)
+    sparse_grad[indices] = flat_grad[indices]
+    
+    return sparse_grad.view_as(grad)
+
+
 class LinearWithVerification(Function):
     
     perf_log = PerfLog(True)
+
+    @staticmethod
+    def copy_sparse_and_perf(x_device : torch.Tensor):
+        if str(x_device.device) == "cpu":
+            return x_device, 0
+
+        st = time.perf_counter()
+        sp = top_k_sparsify(x_device, 0.1).to_sparse()
+        x_host = torch.empty_like(sp, device="cpu", pin_memory=True, dtype=x_device.dtype)
+        xx = sp.clone()
+        xx.copy_(x_host)
+        ed = time.perf_counter()
+        return x_host, ed - st
 
     @staticmethod
     def copy_and_perf(x_device : torch.Tensor):
@@ -127,7 +170,10 @@ class LinearWithVerification(Function):
         t = {}
 
         output = LinearWithVerification.linear_and_perf(input, weight, t)
-        LinearWithVerification.copy_and_verify_with_perf(input, weight.t(), output, t, "forward")
+        LinearWithVerification.copy_and_perf(output)
+        
+        #LinearWithVerification.copy_and_verify_with_perf(input, weight.t(), output, t, "forward")
+        LinearWithVerification.verify(input, weight.t(), output)
 
         if bias is not None:
             output += bias.unsqueeze(0).expand_as(output)
@@ -143,13 +189,17 @@ class LinearWithVerification(Function):
         # Compute gradients
         t_grad = {}
         grad_input = LinearWithVerification.matmul_and_perf(grad_output, weight, t_grad)
-        LinearWithVerification.copy_and_verify_with_perf(grad_output, weight, grad_input, t_grad, "backward_grad")
+        LinearWithVerification.copy_and_perf(grad_input)
+        #LinearWithVerification.copy_and_verify_with_perf(grad_output, weight, grad_input, t_grad, "backward_grad")
+        LinearWithVerification.verify(grad_output, weight, grad_input)
 
         # Compute weights
         t_weight = {}
         grad_out_t = grad_output.transpose(-2, -1)
         grad_weight = LinearWithVerification.matmul_and_perf(grad_out_t, input, t_weight)
-        LinearWithVerification.copy_and_verify_with_perf(grad_out_t, input, grad_weight, t_weight, "backward_weight")
+        LinearWithVerification.copy_and_perf(grad_weight)
+        LinearWithVerification.verify(grad_out_t, input, grad_weight)
+        #LinearWithVerification.copy_and_verify_with_perf(grad_out_t, input, grad_weight, t_weight, "backward_weight")
 
         grad_bias = grad_output.sum(0) if bias is not None else None
         return grad_input, grad_weight, grad_bias
@@ -157,6 +207,9 @@ class LinearWithVerification(Function):
     @staticmethod
     def verify(A, B, C):
         st = time.perf_counter()
+        A = torch.empty_like(A, device="cpu")
+        B = torch.empty_like(B, device="cpu")
+        C = torch.empty_like(C, device="cpu")
         loss = freivalds_algorithm(A, B, C)
         ed = time.perf_counter()
         return loss, ed-st
@@ -210,6 +263,13 @@ if __name__ == "__main__":
 
     model = TestModule(inc, outc).to(device)
     x = torch.randn(batch, inc)
+    
+    
+
+    print(top_k_sparsify(x, 0.1).to_sparse())
+    exit(-1)
+
+
     y = torch.randn(batch, 1)
     dataset = TensorDataset(x, y)
     dataloader = DataLoader(dataset, batch_size=32)

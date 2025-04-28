@@ -54,12 +54,15 @@ class Train:
         elif isinstance(self._ds_config, bool):
             if self._ds_config:
                 if self._cpu_only:
-                    return "ds_config/ds_config_cpu.json"
+                    if self._use_half:
+                        return "ds_config/ds_config_cpu_fp16.json"
+                    else:
+                        return "ds_config/ds_config_cpu_fp32.json"
                 else:
                     if self._use_half:
                         return "ds_config/ds_config_fp16.json"
                     else:
-                        return "ds_config/ds_config.json"
+                        return "ds_config/ds_config_fp32.json"
 
         return None
 
