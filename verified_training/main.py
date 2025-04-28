@@ -1,17 +1,11 @@
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import json
-import time
 import deepspeed
 
-from torch.nn import Linear, Module, Parameter
+from torch.nn import Linear 
 from transformers import AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from torch.optim import AdamW
-from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset
 from verify_linear import VerifiedLinear, LinearWithVerification
 
 from transformers import AutoTokenizer 
@@ -39,34 +33,6 @@ def eval_model(model_path):
 
     final_ppl = ppl_metric.compute()
     print(f"Perplexity on C4 validation set: {final_ppl.item():.2f}")
-
-def get_datasets(model_path, split="train"):
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=128, return_tensors="pt")
-
-    c4_streamed = load_dataset("../data/c4", split=split)
-    column_names = c4_streamed.column_names
-
-    tokenized_datasets = c4_streamed.map(tokenize_function, remove_columns=column_names, num_proc=32, load_from_cache_file=True, batched=True)
-
-    if split == "test":
-        return DataLoader(tokenized_datasets, shuffle=True, batch_size=1)
-
-
-
-    def shift_tokens(examples):
-        input_ids = examples["input_ids"] #.to(dtype=torch.float16)
-        labels = input_ids.copy()
-        labels[:-1] = input_ids[1:]  # Shift input_ids by one to the right for labels
-        labels[-1] = tokenizer.eos_token_id  # Set the last label to the EOS token
-        examples["labels"] = labels
-        return examples
-
-    lm_datasets = tokenized_datasets.map(shift_tokens, num_proc=32, load_from_cache_file=True)
-    return DataLoader(lm_datasets, shuffle=True, batch_size=1)
 
 def train(model, dataloader, num_epochs, batch_size, use_deepspeed=True, use_half = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -145,20 +111,21 @@ def train(model, dataloader, num_epochs, batch_size, use_deepspeed=True, use_hal
         #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
         print(f"Epoch {epoch + 1}, Loss: {loss.item()}")
 
-def replace_param(origin : Linear):
-    new_linear = VerifiedLinear(origin.in_features, origin.out_features, origin.bias)
-    new_linear.weight = origin.weight
-    if origin.bias:
-        new_linear.bias = origin.bias
-    return new_linear
 
-def replace_linear(model):
-    for name, module in model.named_children():
-        if isinstance(module, nn.Linear):
-            veri_linear = replace_param(module)
-            setattr(model, name, veri_linear)
-        else:
-            replace_linear(module)
+from verified_training.train import *
+from verified_training.llm_model import create_llm_model
+from verified_training.utils.log_utils import g_logger, logging
+import os
+
+def train_one_case(verify, use_ds=True, half=False, cpu_only=True):
+    if cpu_only:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    model_name = "meta-llama/Llama-3.2-1B-Instruct"
+    t = Train(model_name, get_c4_datasets(model_name), verify,
+               10, 1, use_ds, half, cpu_only, "logs/perf-gpu-half.json")
+    t.do()
+
 
 def main(use_ds, use_half):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,7 +144,8 @@ def main(use_ds, use_half):
         print(f"Peak memory allocated: {peak_memory:.2f} GB")
 
 if __name__ == "__main__":
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    main(True, True)
+    #model_name = "meta-llama/Llama-3.2-1B-Instruct"
+    #main(True, True)
+    train_one_case(True, half=True, cpu_only=False)
     #main(False)
     #eval_model(model_name)
