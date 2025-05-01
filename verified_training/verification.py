@@ -91,11 +91,10 @@ def freivalds_algorithm(A, B, C, k=10):
     ABr = A @ Br
     Cr = C @ r
 
-    if not torch.allclose(ABr, Cr):
-        ret = F.mse_loss(ABr, Cr).item()
-        return ret
-
-    return 0
+    ret = F.mse_loss(ABr, Cr).item()
+    #if not torch.allclose(ABr, Cr):
+    #    ret = F.mse_loss(ABr, Cr).item()
+    return ret
 
 def random_sparse_matrix(rows, cols, nnz_perc=0.6, dtype=torch.float32):
     """
