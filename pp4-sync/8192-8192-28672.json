@@ -1,0 +1,82 @@
+{
+    "forward": {
+        "cpu": {
+            "copy_out": 0.14237526202812156,
+            "verify_out": 0.044780113699628,
+            "total": 0.18715537572774957
+        },
+        "gpu": {
+            "forward": 0.8543908890198044,
+            "total": 0.8543908890198044
+        },
+        "meta": {
+            "8192-8192-28672-cpu": {
+                "forward-loss": 1.8984406787575163,
+                "loss-backward-st": 0.12029016120953763,
+                "backward-st-backward-ed": 1.9530563218360568,
+                "backward-ed-step-st": 2.2595718582259847e-06,
+                "step-st-step-ed": 0.3628173875771067
+            },
+            "8192-8192-28672-cuda": {
+                "forward-loss": 0.8543908890198044,
+                "loss-backward-st": 0.014668838413273717,
+                "backward-st-backward-ed": 0.8053447524670194,
+                "backward-ed-step-st": 1.9236269624943427e-06,
+                "step-st-step-ed": 0.07927944531485914
+            },
+            "8192-8192-28672-copy": {
+                "st-copy_out": 0.14237526202812156,
+                "copy_out-copy_grad": 0.040691817223906836,
+                "copy_grad-copy_delta_weight": 0.14229454407270284,
+                "copy_delta_weight-verify-F-out-st": 7.767378887597551e-07,
+                "verify-F-out-st-verify-F-out-ed": 0.044780113699628,
+                "verify-F-out-ed-verify-B-grad-st": 2.4816526615239204e-06,
+                "verify-B-grad-st-verify-B-grad-ed": 0.030272284190745114,
+                "verify-B-grad-ed-verify-B-deltaw-st": 2.4744299577271686e-06,
+                "verify-B-deltaw-st-verify-B-deltaw-ed": 0.04478769885138311
+            }
+        }
+    },
+    "backward": {
+        "cpu": {
+            "update": 0.3628173875771067,
+            "verify_grad": 0.030272284190745114,
+            "verify_delta": 0.04478769885138311,
+            "cp_delta_w": 0.14229454407270284,
+            "cp_grad": 0.040691817223906836,
+            "total": 0.6208637319158445
+        },
+        "gpu": {
+            "backward": 0.8053447524670194,
+            "update": 0.07927944531485914,
+            "total": 0.8846241977818785
+        },
+        "meta": {
+            "8192-8192-28672-cpu": {
+                "forward-loss": 1.8984406787575163,
+                "loss-backward-st": 0.12029016120953763,
+                "backward-st-backward-ed": 1.9530563218360568,
+                "backward-ed-step-st": 2.2595718582259847e-06,
+                "step-st-step-ed": 0.3628173875771067
+            },
+            "8192-8192-28672-cuda": {
+                "forward-loss": 0.8543908890198044,
+                "loss-backward-st": 0.014668838413273717,
+                "backward-st-backward-ed": 0.8053447524670194,
+                "backward-ed-step-st": 1.9236269624943427e-06,
+                "step-st-step-ed": 0.07927944531485914
+            },
+            "8192-8192-28672-copy": {
+                "st-copy_out": 0.14237526202812156,
+                "copy_out-copy_grad": 0.040691817223906836,
+                "copy_grad-copy_delta_weight": 0.14229454407270284,
+                "copy_delta_weight-verify-F-out-st": 7.767378887597551e-07,
+                "verify-F-out-st-verify-F-out-ed": 0.044780113699628,
+                "verify-F-out-ed-verify-B-grad-st": 2.4816526615239204e-06,
+                "verify-B-grad-st-verify-B-grad-ed": 0.030272284190745114,
+                "verify-B-grad-ed-verify-B-deltaw-st": 2.4744299577271686e-06,
+                "verify-B-deltaw-st-verify-B-deltaw-ed": 0.04478769885138311
+            }
+        }
+    }
+}

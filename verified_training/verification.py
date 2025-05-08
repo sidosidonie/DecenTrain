@@ -87,14 +87,15 @@ def freivalds_algorithm(A, B, C, k=10):
     n = C.shape[-1]
     r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
     #r = torch.randn((n, k), dtype=torch.float16, device=A.device)
-    Br = B @ r
-    ABr = A @ Br
-    Cr = C @ r
+    Br = torch.mm(B, r)
+    ABr = torch.mm(A, Br)
+    Cr = torch.mm(C, r)
 
     ret = F.mse_loss(ABr, Cr).item()
+    return ret
     #if not torch.allclose(ABr, Cr):
     #    ret = F.mse_loss(ABr, Cr).item()
-    return ret
+    #return ret
 
 def random_sparse_matrix(rows, cols, nnz_perc=0.6, dtype=torch.float32):
     """
