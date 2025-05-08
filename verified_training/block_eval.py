@@ -23,17 +23,22 @@ def eval_linear(batch, inf, of, dev, prof : Profiler):
     target = torch.randn((batch, of)).to(dev)
     for i in range(iter):
         f.new_iter()
+        torch.cuda.synchronize()
         f.record("forward")
         out = mod(inp)
+        torch.cuda.synchronize()
         f.record("loss")
         grad = out - target
         grad = grad.sum()
+        torch.cuda.synchronize()
         f.record("backward-st")
         grad.backward()
+        torch.cuda.synchronize()
         f.record("backward-ed")
 
         f.record("step-st")
         optimizer.step()
+        torch.cuda.synchronize()
         f.record("step-ed")
 
     pprint(prof.dur_dict())
@@ -189,7 +194,7 @@ def full_perf(seq_len = 8192, d1 = 28672, d2 = 8192):
         "backward": bb
     }
 
-    with open(f"pp2-sync/{seq_len}-{d1}-{d2}.json", "w") as fp:
+    with open(f"pp4-sync/{seq_len}-{d1}-{d2}.json", "w") as fp:
         json.dump(dump, fp, indent=4)
 
     pprint(dump)
