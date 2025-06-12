@@ -15,7 +15,6 @@ from torch.nn import functional as F, init
 from verified_training.verification import time_profile, freivalds_algorithm
 import time
 import pandas as pd
-import deepspeed
 from torch.utils.data import DataLoader, TensorDataset
 
 class PerfLog:

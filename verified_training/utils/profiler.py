@@ -41,6 +41,14 @@ class Record:
         return self.time_stamp_pair[self.cur_iter][key]
 
     def report(self):
+        """
+        return a dict of 
+        {
+          "key0" : duration,
+          "key1" : duration,
+          "key2" : duration
+        }
+        """
         ret = OrderedDict()
         first = self.time_stamp_pair[self.skip]
         for k,v in first.items():

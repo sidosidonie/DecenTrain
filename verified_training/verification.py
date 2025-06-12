@@ -83,19 +83,27 @@ class GlobRandomVec:
 glob_random_vec = GlobRandomVec()
 
 def freivalds_algorithm_linear(A, B, C, k=10):
-    #print(f"{A.shape=}, {A.device}")
-    #print(f"{B.shape=}, {B.device}")
-    #print(f"{C.shape=}, {C.device}")
+    print(f"{A.shape=}, {A.device}")
+    print(f"{B.shape=}, {B.device}")
+    print(f"{C.shape=}, {C.device}")
 
     n = C.shape[-1]
     r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
     #print(f"{r.shape=}")
     #r = torch.randn((n, k), dtype=torch.float16, device=A.device)
-    Br = F.linear(B, r)
-    ABr = F.linear(A, Br)
-    Cr = F.linear(C, r)
+    #Br = F.linear(B, r)
+    #ABr = F.linear(A, Br)
+    #Cr = F.linear(C, r)
+    Br = torch.mm(B, r)
+    ABr = torch.mm(A, Br)
+    Cr = torch.mm(C, r)
 
     ret = F.mse_loss(ABr, Cr).item()
+    if ret > 1:
+        print(f"freivalds_algorithm: {ret=}")
+        print(f"Cr = {Cr}")
+        print(f"ABr = {ABr}")
+        exit(-1)
     return ret
 
 #@time_profile()
