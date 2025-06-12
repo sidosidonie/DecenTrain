@@ -18,7 +18,7 @@ import sys
 import os
 from verified_training.utils.log_utils import g_logger
 from verified_training.utils.profiler import Profiler 
-from verified_training.layer import copy_to_cpu, all_close, VerifyLinear
+from verified_training.mlp_layer import copy_to_cpu, all_close, VerifyLinear
 
 DISABLE_VERIFY = False
 
@@ -53,16 +53,18 @@ def eager_attention_forward_verify(
 
     g_logger.info("parallel: block1")
 
-    t2 = prof.new("attn-kv")
-    t2_cpu = prof.new("attn-kv-cpu")
+    t2 = prof.new("attn-qkv:  softmax, dropout, kv | qk, softmax, dropout")
+    t2_cpu = prof.new(">> attn-kv-cpu")
+    t2_gpu = prof.new(">> attn-kv-gpu")
 
-    t2_0 = prof.new("attn-kv-copy_attn")
-    t2_1 = prof.new("attn-kv-verify")
-    t2_2 = prof.new("attn-kv-matmul_qk")
-    t2_3 = prof.new("attn-kv-scale-softmax-dropout")
+    t2_0 = prof.new(">>>> attn-kv-cpu-copy_attn")
+    t2_1 = prof.new(">>>> attn-kv-cpu-verify")
+    t2_2 = prof.new(">>>> attn-kv-cpu-matmul_qk")
+    t2_3 = prof.new(">>>> attn-kv-cpu-scale-softmax-dropout")
 
-    t3 = prof.new("attn-output")
-    t4 = prof.new("attn-output-verify")
+
+    t3 = prof.new("kv: o_proj | kv_verify")
+    t4 = prof.new("o_proj_verify")
 
     if not DISABLE_VERIFY:
         with torch.cuda.stream(st):
@@ -72,7 +74,10 @@ def eager_attention_forward_verify(
 
     # key_rep, key_rep_cpu
     key_states = repeat_kv(key, module.num_key_value_groups)
+    g_logger.info(f"key_states shape {key_states.shape}")
+    g_logger.info(f"query shape {query.shape}")
     attn_weights = torch.matmul(query, key_states.transpose(2, 3))
+    g_logger.info(f"attn shape {attn_weights.shape}")
     torch.cuda.synchronize()  # sync gpu attn
     before_attn.ed()
 
@@ -86,15 +91,16 @@ def eager_attention_forward_verify(
             st.synchronize()
             t2_0.ed()
 
+            #t2_2.st()
+            #attn_weights_cpu = torch.matmul(query_cpu, key_states_cpu)
+            #st.synchronize()
+            #t2_2.ed()
+
             t2_1.st()
             loss = freivalds_algorithm(query_cpu, key_states_cpu, attn_weights_cpu)
             st.synchronize()
             t2_1.ed()
 
-            t2_2.st()
-            attn_weights_cpu = torch.matmul(query_cpu, key_states_cpu)
-            st.synchronize()
-            t2_2.ed()
 
             t2_3.st()
             attn_weights_scale_cpu = attn_weights_cpu * scaling
@@ -105,12 +111,14 @@ def eager_attention_forward_verify(
             t2_cpu.ed()
 
     torch.cuda.synchronize()  # sync gpu attn
+    t2_gpu.st()
     attn_weights_scale = attn_weights * scaling
     value_states = repeat_kv(value, module.num_key_value_groups)
     attn_weights_scale_soft = F.softmax(attn_weights_scale, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights_drop = F.dropout(attn_weights_scale_soft, p=dropout, training=module.training)
     qkv = torch.matmul(attn_weights_drop, value_states)
     torch.cuda.synchronize()
+    t2_gpu.ed()
 
     t2.ed()
     g_logger.info("parallel: block3")
@@ -170,10 +178,10 @@ class VerifyLlamaAttention(Module):
         inputs_gpu: Tuple[torch.Tensor, torch.Tensor],
         inputs_cpu: Tuple[torch.Tensor, torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        q_proj_time = self.duration.new("q_proj")
-        k_proj_time = self.duration.new("k_proj")
-        v_proj_time = self.duration.new("v_proj")
-        before_attn = self.duration.new("before_attn")
+        q_proj_time = self.duration.new("q_proj: q_proj")
+        k_proj_time = self.duration.new("k_proj: k_proj | q_proj_verify")
+        v_proj_time = self.duration.new("v_proj: v_proj | k_verify") 
+        before_attn = self.duration.new("before_attn: rotary, rep_kv, qk | v_verify, rotary, rep_kv")
 
         hidden_states, position = inputs_gpu
         cos, sin = position[0], position[1]
@@ -185,16 +193,25 @@ class VerifyLlamaAttention(Module):
 
         g_logger.info("Query Proj")
         torch.cuda.synchronize()
+
+        g_logger.info(f"hidden_states shape {hidden_states.shape}")
+        g_logger.info(f"hidden_states weight shape {self.q_proj.weight.shape}")
+
         q_proj_time.st()
         query_states1 = self.q_proj.forward(hidden_states)
         torch.cuda.synchronize()
         q_proj_time.ed()
 
+        g_logger.info("query out shape {}".format(query_states1.shape))
+
         k_proj_time.st()
         key_states1 = self.k_proj.forward(hidden_states)
         if not DISABLE_VERIFY:
             with torch.cuda.stream(self.stream):
-                query_states_cpu = self.q_proj.verify_forward_mm(hidden_states_cpu, query_states1)
+                self.stream.synchronize()
+                query_states1_cpy = copy_to_cpu(query_states1, self.stream)
+                self.stream.synchronize()
+                query_states_cpu = self.q_proj.verify_forward_mm(hidden_states_cpu, query_states1_cpy)
                 query_states_cpu = query_states_cpu.view(hidden_shape).transpose(1, 2)
 
         query_states = query_states1.view(hidden_shape).transpose(1, 2)
@@ -212,6 +229,7 @@ class VerifyLlamaAttention(Module):
         key_states = key_states1.view(hidden_shape).transpose(1, 2)
         torch.cuda.synchronize()
         v_proj_time.ed()
+
 
         # v_verify | qxk
         before_attn.st()
@@ -251,6 +269,8 @@ class VerifyLlamaAttention(Module):
         # output = self.o_proj.forward(attn_output)
         # torch.cuda.synchronize()
         # self.o_proj.verify_forward(attn_output, output)
+        g_logger.info(f"{attn_output.shape=}")
+        exit(-1)
         return attn_output 
 
 def make_attn(attn : LlamaAttention, batch, seq_len):
@@ -288,16 +308,22 @@ def llama_attn_test(prof : Profiler, batch, seq_len):
     for _ in range(prof.iter_n):
         origin_t = t1.new("Origin");
         verify_t = t1.new("Verify")
+        origin_t2 = t2.new("Origin");
+        verify_t2 = t2.new("Verify")
         with torch.enable_grad():
             origin_t.st()
+            origin_t2.st()
             out = origin_attn_model(*inputs_gpu, attention_mask=None)
             torch.cuda.synchronize()
             origin_t.ed()
+            origin_t2.ed()
 
             verify_t.st()
+            verify_t2.st()
             out_v = v_attn(inputs_gpu, inputs)
             torch.cuda.synchronize()
             verify_t.ed()
+            verify_t2.ed()
 
         t1.new_iter()
         t2.new_iter()
@@ -305,6 +331,7 @@ def llama_attn_test(prof : Profiler, batch, seq_len):
         g_logger.info(f"Result close: {all_close(out[0], out_v[0])}")
         g_logger.info(f"Result close: {all_close(out[-1], out_v[-1])}")
 
+    print(f"{DISABLE_VERIFY=}")
     pprint(prof.report())
 
 if __name__ == "__main__":
@@ -321,16 +348,19 @@ if __name__ == "__main__":
     pprint(origin)
     pprint(verify)
 
-    d = OrderedDict()
-    for k, v in origin.items():
-        vv = verify[k]
+    l = []
+    for k, vv in verify.items():
+        v = origin[k]
         if vv == 0:
             overhead = 0
         else:
             overhead = v / vv
-        d[k] = (v, vv, overhead, v - vv)
+        instance = (k, v, vv, overhead, v - vv)
+        l.append(instance)
 
-    pp = pd.DataFrame(d)
-    pp.to_csv("attn_verify.csv")
+    pprint(l)
+    pp = pd.DataFrame(l, columns=["name", "verify", "origin", "overhead", "diff"])
     print(pp)
-
+    pp.to_csv("attn_verify2.csv")
+    m = pp.to_markdown(index=False)
+    print(m)
