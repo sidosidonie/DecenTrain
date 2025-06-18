@@ -36,7 +36,6 @@ class C4Dataset(Dataset):
 def test_dataset():
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
     dataloader = get_c4_datasets(model_name)
-    print(dataloader)
     for inp, lab in dataloader:
         print(inp)
         print(lab)
