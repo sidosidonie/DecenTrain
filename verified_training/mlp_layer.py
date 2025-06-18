@@ -29,15 +29,6 @@ if parent_dir not in sys.path:
 
 torch.set_num_threads(32)
 
-def all_close(a, b):
-    return 0
-    a = a.to("cpu")
-    b = b.to("cpu")
-    loss = F.mse_loss(a, b).item()
-    if loss > 1:
-        exit(-1)
-    return loss
-
 def copy_to_cpu(x_device: torch.Tensor, stream_copy=None):
     if x_device.is_cuda:
         if stream_copy:
@@ -234,12 +225,20 @@ def llama_mlp(batch, hidden, inter, input_tensor, gate=None, up=None, down=None,
 
 class LlamaMLPVerify(torch.nn.Module):
 
-    def __init__(self, origin : LlamaMLP, stream_cpu, stream_gpu):
+    def __init__(self, origin : LlamaMLP, stream_cpu : torch.cuda.Stream , stream_gpu : torch.cuda.Stream):
         self.gate_proj = VerifyLinear(origin.gate_proj, stream_cpu, stream_gpu) 
         self.up_proj = VerifyLinear(origin.up_proj, stream_cpu, stream_gpu) 
         self.down_proj = VerifyLinear(origin.down_proj, stream_cpu, stream_gpu) 
+        self.stream_cpu = stream_cpu
+        self.stream_gpu = stream_gpu
 
     def forward(self, x):
+        e_st = torch.cuda.Event(enable_timing=True) 
+        e_ed = torch.cuda.Event(enable_timing=True)
+
+        self.stream_cpu.synchronize()
+        e_st.record()
+
         pass
 
 

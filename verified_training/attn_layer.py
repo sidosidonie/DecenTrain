@@ -18,7 +18,7 @@ import sys
 import os
 from verified_training.utils.log_utils import g_logger
 from verified_training.utils.profiler import Profiler 
-from verified_training.mlp_layer import copy_to_cpu, all_close, VerifyLinear
+from verified_training.mlp_layer import copy_to_cpu, VerifyLinear
 
 DISABLE_VERIFY = False
 
@@ -270,7 +270,6 @@ class VerifyLlamaAttention(Module):
         # torch.cuda.synchronize()
         # self.o_proj.verify_forward(attn_output, output)
         g_logger.info(f"{attn_output.shape=}")
-        exit(-1)
         return attn_output 
 
 def make_attn(attn : LlamaAttention, batch, seq_len):
@@ -306,9 +305,9 @@ def llama_attn_test(prof : Profiler, batch, seq_len):
     v_attn.to("cuda")
     
     for _ in range(prof.iter_n):
-        origin_t = t1.new("Origin");
+        origin_t = t1.new("Origin")
         verify_t = t1.new("Verify")
-        origin_t2 = t2.new("Origin");
+        origin_t2 = t2.new("Origin")
         verify_t2 = t2.new("Verify")
         with torch.enable_grad():
             origin_t.st()
@@ -327,9 +326,6 @@ def llama_attn_test(prof : Profiler, batch, seq_len):
 
         t1.new_iter()
         t2.new_iter()
-
-        g_logger.info(f"Result close: {all_close(out[0], out_v[0])}")
-        g_logger.info(f"Result close: {all_close(out[-1], out_v[-1])}")
 
     print(f"{DISABLE_VERIFY=}")
     pprint(prof.report())
