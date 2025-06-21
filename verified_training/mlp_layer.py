@@ -10,6 +10,7 @@ from torch import Tensor
 import math
 import time
 from verified_training.verification import time_profile, freivalds_algorithm, freivalds_algorithm_linear
+from verified_training.verify_linear import VerifyLinear, copy_to_cpu
 from torch.nn import functional as F, init
 from torch.nn import Linear, Module, Parameter
 from torch.autograd import Function
@@ -29,134 +30,6 @@ if parent_dir not in sys.path:
 
 torch.set_num_threads(32)
 
-def copy_to_cpu(x_device: torch.Tensor, stream_copy=None):
-    if x_device.is_cuda:
-        if stream_copy:
-            with torch.cuda.stream(stream_copy):
-                x_host = torch.empty_like(
-                    x_device, device="cpu", pin_memory=True, dtype=x_device.dtype)
-                x_host.copy_(x_device, non_blocking=True)
-                return x_host
-        else:
-            x_host = torch.empty_like(
-                x_device, device="cpu", pin_memory=True, dtype=x_device.dtype)
-            x_host.copy_(x_device, non_blocking=True)
-            return x_host
-    else:
-        return x_device
-
-class LinearWithMM(Module):
-    __constants__ = ["in_features", "out_features"]
-    in_features: int
-    out_features: int
-    weight : Tensor
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        device=None,
-        dtype=None,
-    ) -> None:
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = Parameter(
-            torch.empty((in_features, out_features), **factory_kwargs)
-        )
-        if bias:
-            self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
-        else:
-            self.register_parameter("bias", None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
-        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
-        # https://github.com/pytorch/pytorch/issues/57109
-        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, input: Tensor) -> Tensor:
-        return torch.mm(input, self.weight)
-
-    def extra_repr(self) -> str:
-        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
-
-class VerifyLinear:
-
-    def __init__(self, linear: LinearWithMM, st_cpu, st_gpu=None):
-        self.original_module = linear
-        self.in_features = linear.in_features
-        self.out_features = linear.out_features
-        self.weight = linear.weight.clone().to("cpu")
-        self.weight_t = self.weight.t() 
-        self.linear = linear
-        self.ctx = []
-        self.cpu_stream = st_cpu
-        if st_gpu is None:
-            self.gpu_stream = torch.cuda.default_stream()
-        else:
-            self.gpu_stream = st_gpu 
-
-    @torch.enable_grad()
-    def forward(self, input):
-        return self.linear(input)
-
-    def verify_forward_mm(self, input_from_gpu, output_from_gpu):
-        # copy output to cpu
-        with torch.cuda.stream(self.cpu_stream):
-            input_cpu = copy_to_cpu(input_from_gpu, self.cpu_stream)
-            output_cpu = copy_to_cpu(output_from_gpu, self.cpu_stream)
-            #self.stream.synchronize()
-            ee = torch.cuda.Event(blocking=True)
-            ee.record()
-            ee.synchronize()
-            loss = freivalds_algorithm(input_cpu, self.weight_t, output_cpu)
-            g_logger.info(f"forward loss {loss}")
-            self.ctx.append(input_cpu)
-            return output_cpu
-
-    def verify_forward(self, input_from_gpu, output_from_gpu):
-        # copy output to cpu
-        with torch.cuda.stream(self.cpu_stream):
-            output_cpu = copy_to_cpu(output_from_gpu)
-            input_cpu = copy_to_cpu(input_from_gpu)
-            ee = torch.cuda.Event(blocking=True)
-            ee.record()
-            ee.synchronize()
-            #self.stream.wait_event(ee)
-            #self.stream.synchronize()
-            loss = freivalds_algorithm(input_cpu, self.weight_t, output_cpu)
-            g_logger.info(f"forward loss {loss}")
-            self.ctx.append(input_cpu)
-            return output_cpu
-
-    def verify_backward(self, grad_output_gpu, grad_input_gpu, grad_weight_gpu):
-        """
-        Verify grad_input and grad_weight, and return them
-        grad_input = mm(grad_output, weight)
-        grad_weight = mm(grad_output, input)
-        """
-        input_cpu = self.ctx[0]
-        weight_cpu = self.weight
-
-        grad_output_cpu = copy_to_cpu(grad_output_gpu, self.cpu_stream)
-        grad_input_cpu = copy_to_cpu(grad_input_gpu, self.cpu_stream)
-        grad_weight_cpu = copy_to_cpu(grad_weight_gpu, self.cpu_stream)
-
-        self.cpu_stream.synchronize()
-        loss1 = freivalds_algorithm(grad_output_cpu, weight_cpu, grad_input_cpu)
-        loss2 = freivalds_algorithm(grad_output_cpu, input_cpu, grad_weight_cpu)
-        g_logger.info(f"backward loss1 {loss1}")
-        g_logger.info(f"backward loss2 {loss2}")
-
-        return grad_input_cpu, grad_weight_cpu
 
 def llama_mlp(batch, hidden, inter, input_tensor, gate=None, up=None, down=None, prof=None):
 
@@ -169,24 +42,25 @@ def llama_mlp(batch, hidden, inter, input_tensor, gate=None, up=None, down=None,
         down = Linear(inter, hidden, bias=False).to("cuda")
 
     stream_copy = torch.cuda.Stream()
-    #stream_copy = torch.cuda.default_stream(torch.device("cuda"))
+    stream_gpu = torch.cuda.Stream()
+    # stream_copy = torch.cuda.default_stream(torch.device("cuda"))
     # Create a VerifyLinear instance
-    gate_ver = VerifyLinear(gate, stream_copy)
-    up_ver = VerifyLinear(up, stream_copy)
-    down_ver = VerifyLinear(down, stream_copy)
+    gate_ver = VerifyLinear(gate, stream_copy, stream_gpu)
+    up_ver = VerifyLinear(up, stream_copy, stream_gpu)
+    down_ver = VerifyLinear(down, stream_copy, stream_gpu)
 
     input_tensor_cpu = input_tensor.to("cpu")
 
-    e_st = torch.cuda.Event(enable_timing=True) 
-    e_ed = torch.cuda.Event(enable_timing=True) 
+    e_st = torch.cuda.Event(enable_timing=True)
+    e_ed = torch.cuda.Event(enable_timing=True)
 
     torch.cuda.synchronize()
     e_st.record()
     stream_copy.synchronize()
 
-    e1 = torch.cuda.Event(enable_timing=True) 
-    e2 = torch.cuda.Event(enable_timing=True) 
-    e3 = torch.cuda.Event(enable_timing=True) 
+    e1 = torch.cuda.Event(enable_timing=True)
+    e2 = torch.cuda.Event(enable_timing=True)
+    e3 = torch.cuda.Event(enable_timing=True)
     # Forward pass
     act_gate = gate_ver.forward(input_tensor)
     e1.record()
@@ -194,14 +68,14 @@ def llama_mlp(batch, hidden, inter, input_tensor, gate=None, up=None, down=None,
     up_proj = up_ver.forward(input_tensor)
     e2.record()
 
-
     stream_copy.wait_event(e1)
     with torch.cuda.stream(stream_copy):
-        act_gate_cpu = gate_ver.verify_forward(input_tensor_cpu, act_gate)
+        loss, act_gate_cpu = gate_ver.verify_forward(
+            input_tensor_cpu, act_gate)
         act_gate_cpu = ACT2FN["silu"](act_gate_cpu)
 
     stream_copy.wait_event(e2)
-    up_proj_cpu = up_ver.verify_forward(input_tensor_cpu, up_proj)
+    loss_up, up_proj_cpu = up_ver.verify_forward(input_tensor_cpu, up_proj)
 
     act_up = act_gate_out * up_proj
     down_proj = down_ver.forward(act_up)
@@ -213,52 +87,112 @@ def llama_mlp(batch, hidden, inter, input_tensor, gate=None, up=None, down=None,
 
     # down
     stream_copy.wait_event(e3)
-    down_proj_cpu = down_ver.verify_forward(act_up_cpu, down_proj) 
+    loss_down, down_proj_cpu = down_ver.verify_forward(act_up_cpu, down_proj)
 
-    ########### backward 
-    #return down_proj, down_proj_cpu
+    # backward
+    # return down_proj, down_proj_cpu
     stream_copy.synchronize()
-    torch.cuda.synchronize()
+    stream_gpu.synchronize()
     e_ed.record()
     print("Verify ", e_st.elapsed_time(e_ed))
     return e_st.elapsed_time(e_ed), down_proj, None
 
+
 class LlamaMLPVerify(torch.nn.Module):
 
-    def __init__(self, origin : LlamaMLP, stream_cpu : torch.cuda.Stream , stream_gpu : torch.cuda.Stream):
-        self.gate_proj = VerifyLinear(origin.gate_proj, stream_cpu, stream_gpu) 
-        self.up_proj = VerifyLinear(origin.up_proj, stream_cpu, stream_gpu) 
-        self.down_proj = VerifyLinear(origin.down_proj, stream_cpu, stream_gpu) 
+    def __init__(self, origin: LlamaMLP, stream_cpu: torch.cuda.Stream, stream_gpu: torch.cuda.Stream):
+        """
+        gate = gate_proj(x) || up = up_proj(x)
+        gate_cpu = copy_to_cpu(gate)
+        verify(gate_cpu, x)
+        up_cpu = copy_to_cpu(up)
+        verify(up_cpu, x)
+
+        gate_silu = silu(gate) * up
+        gate_silu_cpu =silu(gate_cpu) * up_cpu
+
+        down = down_proj(gate_silu)
+        down_cpu = copy_to_cpu(down)
+
+        verify(down_cpu, gate_silu_cpu)
+
+        return down_proj(silu(gate_proj(x)) * up_proj(x))
+        """
+        super().__init__()
+        self.gate_proj = VerifyLinear(origin.gate_proj, stream_cpu, stream_gpu)
+        self.up_proj = VerifyLinear(origin.up_proj, stream_cpu, stream_gpu)
+        self.down_proj = VerifyLinear(origin.down_proj, stream_cpu, stream_gpu)
         self.stream_cpu = stream_cpu
         self.stream_gpu = stream_gpu
+        self.event_st = torch.cuda.Event(enable_timing=True, blocking=True)
+        self.event_ed = torch.cuda.Event(enable_timing=True, blocking=True)
 
-    def forward(self, x):
-        e_st = torch.cuda.Event(enable_timing=True) 
-        e_ed = torch.cuda.Event(enable_timing=True)
+    def act(self, x, stream):
+        with torch.cuda.stream(stream):
+            out = ACT2FN["silu"](x)
+            return out
 
-        self.stream_cpu.synchronize()
-        e_st.record()
+    def mul(self, x, y, stream):
+        with torch.cuda.stream(stream):
+            out = x * y
+            return out
 
-        pass
+    def forward(self, x_gpu):
+        g_logger.info("==== Verify MLP ====")
+        # Issue all GPU kernels
+        g_logger.info("==== GPU Gate, act and up ====")
+        self.event_st.record(self.stream_cpu)
+        gate = self.gate_proj.forward(x_gpu)
+        gate_silu = self.act(gate, self.stream_gpu)
+        up = self.up_proj.forward(x_gpu)
+
+        g_logger.info(">>> Verify gate projection <<<")
+        x_cpu, e_copy = copy_to_cpu(x_gpu, self.stream_cpu)
+        e_copy.synchronize()
+        loss_gate, gate_cpu = self.gate_proj.verify_forward(x_cpu, gate)
+        gate_silu_cpu = self.act(gate_cpu, self.stream_cpu)
+
+        g_logger.info(">>> Verify up projection <<<")
+        loss_up, up_cpu = self.up_proj.verify_forward(x_cpu, up)
+        gate_silu_x_up_cpu = self.mul(gate_silu_cpu, up_cpu, self.stream_cpu)
+
+        g_logger.info("=== GPU Mul, Down projection ===")
+        gate_silu_x_up = self.mul(gate_silu, up, self.stream_gpu)
+        down = self.down_proj.forward(gate_silu_x_up)
+
+        g_logger.info(">>> Verify down projection <<<")
+        loss_down, down_cpu = self.down_proj.verify_forward(
+            gate_silu_x_up_cpu, down)
+
+        self.down_proj.verify_event.synchronize()
+        self.event_ed.record(self.stream_cpu)
+
+        t = self.event_st.elapsed_time(self.event_ed)
+        g_logger.info(
+            f"Loss gate: {loss_gate}, Loss up: {loss_up}, Loss down: {loss_down}")
+        # return down, down_cpu, t
+        g_logger.info("==== Verify MLP Done ====")
+        return down
 
 
-def llama_mlp_test(iter = 100, batch = 1024):
+def llama_mlp_test(iter=100, batch=1024):
     prof = Profiler("log")
     p1 = prof.add_time_span("original_mlp")
     p2 = prof.add_time_span("verify_mlp")
 
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
     config = LlamaConfig(model_name)
-    config.mlp_bias=False
+    config.mlp_bias = False
     print(config)
 
     time.sleep(0.1)
     mlp = LlamaMLP(config)
     mlp.to("cuda")
 
-    x = torch.randn(batch, config.hidden_size, device="cuda", requires_grad=True)
-    total_origin = 0 
-    total_verify = 0 
+    x = torch.randn(batch, config.hidden_size,
+                    device="cuda", requires_grad=True)
+    total_origin = 0
+    total_verify = 0
     e_st = torch.cuda.Event(enable_timing=True)
     e_ed = torch.cuda.Event(enable_timing=True)
 
@@ -266,7 +200,8 @@ def llama_mlp_test(iter = 100, batch = 1024):
         g_logger.info("###########################")
         torch.cuda.synchronize()
         e_st.record()
-        t, ver_mlp, ver_mlp_cpu = llama_mlp(batch, config.hidden_size, config.intermediate_size, x, mlp.gate_proj, mlp.up_proj, mlp.down_proj, p2)
+        t, ver_mlp, ver_mlp_cpu = llama_mlp(
+            batch, config.hidden_size, config.intermediate_size, x, mlp.gate_proj, mlp.up_proj, mlp.down_proj, p2)
         torch.cuda.synchronize()
         e_ed.record()
         if i < 5:
@@ -294,11 +229,13 @@ def llama_mlp_test(iter = 100, batch = 1024):
 
     origin_time = total_origin / (iter-5)
     print("Origin time: ", origin_time)
-    #origin = prof.dur_dict()["original_mlp"]["0-1"]
-    #verify = prof.dur_dict()["verify_mlp"]["0-1"]
-    g_logger.info(f"Origin: {origin_time}, Verify: {verify_time} Overhead: {(verify_time - origin_time) / origin_time}")
+    # origin = prof.dur_dict()["original_mlp"]["0-1"]
+    # verify = prof.dur_dict()["verify_mlp"]["0-1"]
+    g_logger.info(
+        f"Origin: {origin_time}, Verify: {verify_time} Overhead: {(verify_time - origin_time) / origin_time}")
 
     return (origin_time, verify_time, (verify_time - origin_time) / origin_time)
+
 
 def gpu_cpu_modeul(batch=4, in_feat=2, out_feat=3):
     torch.cuda.init()
@@ -318,15 +255,15 @@ def gpu_cpu_modeul(batch=4, in_feat=2, out_feat=3):
     x_gpu.requires_grad_(True)
 
     out_grad = torch.randn(batch, in_feat, device="cuda", requires_grad=True)
-    out_grad_cpu = out_grad.to("cpu") 
+    out_grad_cpu = out_grad.to("cpu")
     out_grad_cpu.requires_grad_(True)
     out_grad_cpu.retain_grad()
 
     with torch.enable_grad():
-        #y_cpu = l1(x_cpu)
+        # y_cpu = l1(x_cpu)
         y1_gpu = l1(x_gpu)
         y1_gpu.retain_grad()
-        #y_cpu = v1(x_cpu, y_gpu)
+        # y_cpu = v1(x_cpu, y_gpu)
         y1_cpu = v1.forward(x_cpu, y1_gpu)
 
         y2_gpu = l2(y1_gpu)
@@ -339,30 +276,67 @@ def gpu_cpu_modeul(batch=4, in_feat=2, out_feat=3):
         grad = (out_grad_cpu, y1_gpu.grad, l2.weight.grad)
         g_logger.info(grad)
 
-        grad_in_cpu, grad_w2_cpu = v2.backward(out_grad_cpu, y1_gpu.grad, l2.weight.grad)
+        grad_in_cpu, grad_w2_cpu = v2.backward(
+            out_grad_cpu, y1_gpu.grad, l2.weight.grad)
 
         y1_cpu.grad = grad_in_cpu
         v2.weight.grad = grad_w2_cpu
 
         g_logger.info(y1_cpu.grad)
 
-    #y_cpu.backward(gradient = final_grad, inputs = [x_gpu.grad, linear_gpu.weight.grad])
+    # y_cpu.backward(gradient = final_grad, inputs = [x_gpu.grad, linear_gpu.weight.grad])
+
+
+def test_mlp(itern, batch, seq_len, config: LlamaConfig):
+    mlp = LlamaMLP(config)
+    mlp.to("cuda")
+    vmlp = LlamaMLPVerify(mlp, torch.cuda.Stream(), torch.cuda.Stream())
+
+    x = torch.randn(batch * seq_len, config.hidden_size,
+                    device="cuda", requires_grad=False)
+    x_cpu = x.clone().to("cpu")
+
+    total_verify = 0
+    total_origin = 0
+    for i in range(itern):
+        vmlp.stream_cpu.synchronize()
+        vmlp.stream_gpu.synchronize()
+
+        out, out_cpu, verify_time = vmlp.forward(x, x_cpu)
+
+        st_ori = torch.cuda.Event(enable_timing=True, blocking=True)
+        ed_ori = torch.cuda.Event(enable_timing=True, blocking=True)
+
+        st_ori.record()
+        out_origin = mlp(x)
+        ed_ori.record()
+        torch.cuda.synchronize()
+        t_origin = st_ori.elapsed_time(ed_ori)
+        g_logger.info(
+            f"Iteration {i+1}/{itern}, Verify Time: {verify_time} ms, Origin Time taken: {t_origin} ms")
+
+        diff = F.mse_loss(out, out_origin)
+        g_logger.info(f"Iteration {i+1}/{itern}, MSE Loss: {diff.item()}")
+
 
 if __name__ == "__main__":
-    #gpu_cpu_modeul()
-    ll = {
-        "batch" : [16, 32, 128, 256, 512, 1024, 2048, 4096, 8192 ,12384],
-        "origin" : [],
-        "verify" : [],
-        "overhead" : []
-    }
-    #for b in [16, 32, 128, 256, 512, 1024, 2048, 4096]:
-    for b in ll["batch"]:
-        origin, verify, overhead = llama_mlp_test(iter=100, batch=b)
-        ll["origin"].append(origin)
-        ll["verify"].append(verify)
-        ll["overhead"].append(overhead)
+    model_name = "meta-llama/Llama-3.2-1B-Instruct"
+    config = LlamaConfig(model_name)
+    config.mlp_bias = False
+    test_mlp(10, batch=1, seq_len=2048, config=config)
+    # ll = {
+    #    "batch" : [16, 32, 128, 256, 512, 1024, 2048, 4096, 8192 ,12384],
+    #    "origin" : [],
+    #    "verify" : [],
+    #    "overhead" : []
+    # }
+    # for b in [16, 32, 128, 256, 512, 1024, 2048, 4096]:
+    # for b in ll["batch"]:
+    #    origin, verify, overhead = llama_mlp_test(iter=100, batch=b)
+    #    ll["origin"].append(origin)
+    #    ll["verify"].append(verify)
+    #    ll["overhead"].append(overhead)
 
-    df = pd.DataFrame(ll)
-    print(df)
-    print(df.to_markdown())
+    # df = pd.DataFrame(ll)
+    # print(df)
+    # print(df.to_markdown())

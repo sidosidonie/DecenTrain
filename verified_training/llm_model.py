@@ -3,8 +3,10 @@
 """
 from torch.nn import Linear 
 from transformers import AutoModelForCausalLM
-from verified_training.verify_linear import VerifiedLinear 
+from verified_training.mlp_layer import LlamaMLPVerify, LlamaMLP
+from verified_training.attn_layer import VerifyLlamaAttention , LlamaAttention
 from verified_training.utils.log_utils import g_logger
+from verified_training.utils.profiler import Profiler 
 import torch
 from torch.nn import functional as F, init
 from torch import Tensor
@@ -129,30 +131,43 @@ def replace_sparse_linear_and_add_name(mod : torch.nn.Module):
         if isinstance(module, torch.nn.Linear):
             print("Module name is ", name)
 
-
-def replace_param(origin : Linear):
-    new_linear = VerifiedLinear(origin.in_features, origin.out_features, origin.bias)
-    new_linear.weight = origin.weight
-    if origin.bias:
-        new_linear.bias = origin.bias
+def replace_param_attn(origin : LlamaAttention, stream_cpu, stream_gpu, dur):
+    new_linear = VerifyLlamaAttention(origin, stream_cpu, stream_gpu, dur)
     return new_linear
 
-def replace_linear(model):
+def replace_attn(model, cpu, gpu, dur):
     for name, module in model.named_children():
-        if isinstance(module, Linear):
-            veri_linear = replace_param(module)
-            setattr(model, name, veri_linear)
+        if isinstance(module, LlamaAttention):
+            veri_mlp = replace_param_attn(module, cpu, gpu, dur)
+            setattr(model, name, veri_mlp)
         else:
-            replace_linear(module)
+            replace_attn(module, cpu, gpu, dur)
 
-def create_llm_model(model_path, verify=False):
+def replace_param_mlp(origin : LlamaMLP, stream_cpu, stream_gpu):
+    new_linear = LlamaMLPVerify(origin, stream_cpu, stream_gpu)
+    return new_linear
+
+def replace_mlp(model, cpu, gpu):
+    for name, module in model.named_children():
+        if isinstance(module, LlamaMLP):
+            veri_mlp = replace_param_mlp(module, cpu, gpu)
+            setattr(model, name, veri_mlp)
+        else:
+            replace_mlp(module, cpu, gpu)
+
+def create_llm_model(model_path, verify=False, cpu=None, gpu=None):
     model = AutoModelForCausalLM.from_pretrained(model_path)
+    print(model)
+    model.to("cuda")
+    model.config.mlp_bias = False
+    p = Profiler()
+    dur = p.add_time_span("attn")
     if verify:
         g_logger.debug("Creating verified LLM")
-        replace_linear(model)
+        replace_mlp(model, cpu, gpu)
+        replace_attn(model, cpu, gpu, dur)
 
     return model
-
 
 def create_sparse_llm_model(model_path):
     model = AutoModelForCausalLM.from_pretrained(model_path)
@@ -160,7 +175,8 @@ def create_sparse_llm_model(model_path):
     replace_sparse_linear_and_add_name(model)
     return model
 
-
 if __name__ == "__main__":
-    mod = create_sparse_llm_model("meta-llama/Llama-3.2-1B-Instruct")
+    cpu = torch.cuda.Stream()
+    gpu = torch.cuda.default_stream()
+    mod = create_llm_model("meta-llama/Llama-3.2-1B-Instruct", True, cpu, gpu)
     print(mod)
