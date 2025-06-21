@@ -3,19 +3,19 @@ from datasets import load_dataset
 from transformers import AutoTokenizer 
 import torch
 
-def get_c4_datasets(model_path, split="train"):
+def get_c4_datasets(model_path, batch, max_length, split="train"):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
 
     def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=2048, return_tensors="pt")
+        return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=max_length, return_tensors="pt")
 
     c4_streamed = load_dataset("/home/ubuntu/data/c4", split=split)
     column_names = c4_streamed.column_names
 
     tokenized_datasets = c4_streamed.map(tokenize_function, remove_columns=column_names, num_proc=32, load_from_cache_file=True, batched=True)
     ds = C4Dataset(tokenized_datasets, tokenizer)
-    return DataLoader(ds, shuffle=True, batch_size=1)
+    return DataLoader(ds, shuffle=True, batch_size=batch)
 
 class C4Dataset(Dataset):
     def __init__(self, tokenized_datasets, tokenizer):

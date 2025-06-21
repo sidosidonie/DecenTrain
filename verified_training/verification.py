@@ -8,6 +8,7 @@ from torch.nn import functional as F, init
 from torch.nn.parameter import Parameter, UninitializedParameter
 import inspect
 
+
 def time_profile(log_file=None, log_dict=None):
 
     def _time_profile(func):
@@ -45,7 +46,9 @@ def time_profile(log_file=None, log_dict=None):
 
     return _time_profile
 
+
 log_file = open("log.perf", "a+")
+
 
 @time_profile()
 def freivalds_algorithm_sparse(A, B, C, k=10):
@@ -61,6 +64,7 @@ def freivalds_algorithm_sparse(A, B, C, k=10):
         return loss
 
     return 0
+
 
 class GlobRandomVec:
 
@@ -80,7 +84,9 @@ class GlobRandomVec:
             self.vec[key] = r_vec
             return self.vec[key]
 
+
 glob_random_vec = GlobRandomVec()
+
 
 def freivalds_algorithm_linear(A, B, C, k=10):
     print(f"{A.shape=}, {A.device}")
@@ -89,11 +95,11 @@ def freivalds_algorithm_linear(A, B, C, k=10):
 
     n = C.shape[-1]
     r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
-    #print(f"{r.shape=}")
-    #r = torch.randn((n, k), dtype=torch.float16, device=A.device)
-    #Br = F.linear(B, r)
-    #ABr = F.linear(A, Br)
-    #Cr = F.linear(C, r)
+    # print(f"{r.shape=}")
+    # r = torch.randn((n, k), dtype=torch.float16, device=A.device)
+    # Br = F.linear(B, r)
+    # ABr = F.linear(A, Br)
+    # Cr = F.linear(C, r)
     Br = torch.mm(B, r)
     ABr = torch.mm(A, Br)
     Cr = torch.mm(C, r)
@@ -106,38 +112,63 @@ def freivalds_algorithm_linear(A, B, C, k=10):
         exit(-1)
     return ret
 
-#@time_profile()
-def freivalds_algorithm(A, B, C, k=10):
-    #print(f"{A.shape=}, {A.device}")
-    #print(f"{B.shape=}, {B.device}")
-    #print(f"{C.shape=}, {C.device}")
+# @time_profile()
 
-    n = C.shape[-1]
-    r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
-    #r = torch.randn((n, k), dtype=torch.float16, device=A.device)
-    if len(A.shape) > 2:
-        # change A from (n, n, k) to (n*n, k)
-        #A = A.reshape(-1, A.shape[-1])
-        #B = B.reshape(-1, B.shape[-1])
-        #C = C.reshape(-1, C.shape[-1])
-        Br = torch.matmul(B, r)
-        ABr = torch.matmul(A, Br)
-        Cr = torch.matmul(C, r)
-    else:
-        Br = torch.mm(B, r)
-        ABr = torch.mm(A, Br)
-        Cr = torch.mm(C, r)
 
-    ret = F.mse_loss(ABr, Cr).item()
-    if ret > 1:
-        print(f"freivalds_algorithm: {ret=}")
-        print(f"gpu C = {C}")
-        print(f"cpu C = {torch.matmul(A, B)}")
-        exit(-1)
-    return ret
-    #if not torch.allclose(ABr, Cr):
+def freivalds_algorithm(A, B, C, stream, e1=None, e2=None, e3=None, k=10):
+    # print(f"{A.shape=}, {A.device}")
+    # print(f"{B.shape=}, {B.device}")
+    # print(f"{C.shape=}, {C.device}")
+    with torch.cuda.stream(stream):
+        n = C.shape[-1]
+        r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
+        # r = torch.randn((n, k), dtype=torch.float16, device=A.device)
+        if len(A.shape) > 2:
+            # change A from (n, n, k) to (n*n, k)
+            # A = A.reshape(-1, A.shape[-1])
+            # B = B.reshape(-1, B.shape[-1])
+            # C = C.reshape(-1, C.shape[-1])
+            if e2 is not None:
+                e2.synchronize()
+            Br = torch.matmul(B, r)
+
+            if e1 is not None:
+                e1.synchronize()
+            ABr = torch.matmul(A, Br)
+
+            if e3 is not None:
+                e3.synchronize()
+            Cr = torch.matmul(C, r)
+        else:
+            if e2 is not None:
+                e2.synchronize()
+            Br = torch.mm(B, r)
+
+            if e1 is not None:
+                e1.synchronize()
+            ABr = torch.mm(A, Br)
+
+            if e3 is not None:
+                e3.synchronize()
+
+            Cr = torch.mm(C, r)
+
+        ret = F.mse_loss(ABr, Cr).item()
+        if ret > 1:
+            print(f"freivalds_algorithm: {ret=}")
+            print(f"ABr = {ABr}")
+            print(f"Cr {Cr.shape=} = {Cr}")
+            print(f"r {r.shape=} = {r}")
+            print(f"A {A.shape=} = {A}")
+            print(f"B {B.shape=} = {B}")
+            print(f"gpu C {C.shape} = {C}")
+            print(f"cpu C = {torch.matmul(A, B)}")
+            exit(-1)
+        return ret
+    # if not torch.allclose(ABr, Cr):
     #    ret = F.mse_loss(ABr, Cr).item()
-    #return ret
+    # return ret
+
 
 def random_sparse_matrix(rows, cols, nnz_perc=0.6, dtype=torch.float32):
     """
@@ -160,17 +191,18 @@ def random_sparse_matrix(rows, cols, nnz_perc=0.6, dtype=torch.float32):
     sparse = torch.sparse_coo_tensor(indices, values, (rows, cols))
     return sparse.coalesce()  # Coalesce to remove any duplicate entries and sum them
 
+
 @time_profile(log_file)
 def freivalds_algorithm_origin(A, B, C, k=10):
     """
     Probabilistically verify whether A @ B == C using Freivalds' algorithm.
-    
+
     Args:
         A (torch.Tensor): Matrix of size (n x n)
         B (torch.Tensor): Matrix of size (n x n)
         C (torch.Tensor): Matrix of size (n x n)
         k (int): Number of iterations 
-    
+
     Returns:
         bool: True if the matrices likely satisfy A @ B == C, False otherwise.
     """
@@ -188,12 +220,14 @@ def freivalds_algorithm_origin(A, B, C, k=10):
 
     return 0
 
+
 @time_profile()
 def transfer_to_gpu(A):
     assert str(A.device) == "cpu"
     AA = A.to("cuda")
     torch.cuda.synchronize()
     return AA
+
 
 @time_profile()
 def transfer_to_cpu(A):
@@ -202,12 +236,14 @@ def transfer_to_cpu(A):
     torch.cuda.synchronize()
     return AA
 
+
 @time_profile()
 def matmul_on_gpu(A, B):
     assert A.is_cuda
     assert B.is_cuda
     CC = A @ B
     return CC
+
 
 class VerifiedLinear(nn.Module):
 
@@ -232,7 +268,8 @@ class VerifiedLinear(nn.Module):
             torch.empty((out_features, in_features), **factory_kwargs)
         )
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
+            self.bias = nn.Parameter(torch.empty(
+                out_features, **factory_kwargs))
         else:
             self.register_parameter("bias", None)
         self.reset_parameters()
@@ -253,6 +290,7 @@ class VerifiedLinear(nn.Module):
     def extra_repr(self) -> str:
         return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
 
+
 def test_sparse():
     sparse = random_sparse_matrix(10, 5)
     print(sparse)
@@ -260,13 +298,14 @@ def test_sparse():
     res = dense @ sparse
     print(res)
 
+
 def main(dt=torch.float32):
     print(f"======= test type {dt}")
     n = 8192
     m = 8192
     k = 2048
-    #A = torch.randn(n, n)
-    #B = torch.randn(n, n)
+    # A = torch.randn(n, n)
+    # B = torch.randn(n, n)
     # mxk kxn -> mxn
     # kxn @ nx1 -> kx1
     # mxk @ kx1 -> mx1
@@ -283,15 +322,17 @@ def main(dt=torch.float32):
     CC = matmul_on_gpu(AA, BB.t())
     C = transfer_to_cpu(CC)
 
-    print("Correct product check:", freivalds_algorithm(A, B.t(), C))          # Expected: True
+    print("Correct product check:", freivalds_algorithm(
+        A, B.t(), C))          # Expected: True
     # print("Correct product check:", freivalds_algorithm_origin(A, B.t(), C))          # Expected: True
     # print("Correct product check:", freivalds_algorithm_sparse(A, B.t(), C))          # Expected: True
-    #print("Incorrect product check:", freivalds_algorithm(A, B, C_wrong))  # Expected: False (most of the time)
+    # print("Incorrect product check:", freivalds_algorithm(A, B, C_wrong))  # Expected: False (most of the time)
     log_file.close()
+
 
 if __name__ == "__main__":
     for _ in range(1):
         main()
         main(torch.half)
-    #main(torch.half)
+    # main(torch.half)
     # test_sparse()
