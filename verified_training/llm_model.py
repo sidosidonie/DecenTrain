@@ -126,11 +126,6 @@ def replace_sparse_linear_and_add_name(mod : torch.nn.Module):
         else:
             replace_sparse_linear_and_add_name(module)
 
-    print("====== after replace ment")
-    for name, module in mod.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            print("Module name is ", name)
-
 def replace_param_attn(origin : LlamaAttention, stream_cpu, stream_gpu, dur):
     new_linear = VerifyLlamaAttention(origin, stream_cpu, stream_gpu, dur)
     return new_linear
@@ -155,11 +150,25 @@ def replace_mlp(model, cpu, gpu):
         else:
             replace_mlp(module, cpu, gpu)
 
+import functools
+
+def dump_layer_outputs(model):
+    layer_outputs = {}
+
+    def hook_fn(name, module, input, output):
+        layer_outputs[name] = output
+
+    hooks = []
+    for name, module in model.named_modules():
+        if len(list(module.parameters())) > 0:
+            hooks.append(module.register_forward_hook(functools.partial(hook_fn, name)))
+    return layer_outputs, hooks
+
 def create_llm_model(model_path, verify=False, cpu=None, gpu=None):
     model = AutoModelForCausalLM.from_pretrained(model_path)
-    print(model)
     model.to("cuda")
-    model.config.mlp_bias = False
+    model.config.mlp_bias = True
+    print("Attention type: ", model.config._attn_implementation)
     p = Profiler()
     dur = p.add_time_span("attn")
     if verify:

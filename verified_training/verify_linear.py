@@ -70,6 +70,9 @@ class VerifyLinear:
         self.weight = linear.weight.clone().to("cpu")
         self.weight_t = self.weight.t() 
         self.linear = linear
+        if self.linear.bias:
+            self.bias_cpu = linear.bias.clone().to("cpu")
+            
         self.ctx = []
         self.cpu_stream = st_cpu
         self.gpu_stream = st_gpu 
@@ -81,6 +84,20 @@ class VerifyLinear:
             out = self.linear(input)
             self.compute_event.record(self.gpu_stream)
             return out
+
+    def add_bias(self, input):
+        if self.linear.bias:
+            with torch.cuda.stream(self.gpu_stream):
+                return input + self.linear.bias
+        else:
+            return input
+
+    def add_bias_cpu(self, input):
+        if self.linear.bias:
+            with torch.cuda.stream(self.cpu_stream):
+                return input + self.bias_cpu
+        else:
+            return input
 
     def verify_forward_mm(self, input_from_gpu, output_from_gpu):
         self.compute_event.synchronize()

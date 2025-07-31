@@ -154,6 +154,7 @@ def freivalds_algorithm(A, B, C, stream, e1=None, e2=None, e3=None, k=10):
             Cr = torch.mm(C, r)
 
         ret = F.mse_loss(ABr, Cr).item()
+        return ret
         if ret > 1:
             print(f"freivalds_algorithm: {ret=}")
             print(f"ABr = {ABr}")

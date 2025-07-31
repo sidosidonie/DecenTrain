@@ -9,7 +9,6 @@ from transformers.activations import ACT2FN
 from torch import Tensor
 import math
 import time
-from verified_training.verification import time_profile, freivalds_algorithm, freivalds_algorithm_linear
 from verified_training.verify_linear import VerifyLinear, copy_to_cpu
 from torch.nn import functional as F, init
 from torch.nn import Linear, Module, Parameter
@@ -143,26 +142,30 @@ class LlamaMLPVerify(torch.nn.Module):
         g_logger.info("==== GPU Gate, act and up ====")
         self.event_st.record(self.stream_cpu)
         gate = self.gate_proj.forward(x_gpu)
-        gate_silu = self.act(gate, self.stream_gpu)
+        gate_bias = self.gate_proj.add_bias(gate)
+        gate_silu = self.act(gate_bias, self.stream_gpu)
         up = self.up_proj.forward(x_gpu)
-
+        up_bias = self.up_proj.add_bias(up)
         g_logger.info(">>> Verify gate projection <<<")
         x_cpu, e_copy = copy_to_cpu(x_gpu, self.stream_cpu)
         e_copy.synchronize()
         loss_gate, gate_cpu = self.gate_proj.verify_forward(x_cpu, gate)
+        gate_cpu = self.gate_proj.add_bias_cpu(gate_cpu)
         gate_silu_cpu = self.act(gate_cpu, self.stream_cpu)
 
         g_logger.info(">>> Verify up projection <<<")
         loss_up, up_cpu = self.up_proj.verify_forward(x_cpu, up)
+        up_cpu = self.up_proj.add_bias_cpu(up_cpu)
         gate_silu_x_up_cpu = self.mul(gate_silu_cpu, up_cpu, self.stream_cpu)
 
         g_logger.info("=== GPU Mul, Down projection ===")
-        gate_silu_x_up = self.mul(gate_silu, up, self.stream_gpu)
+        gate_silu_x_up = self.mul(gate_silu, up_bias, self.stream_gpu)
         down = self.down_proj.forward(gate_silu_x_up)
 
         g_logger.info(">>> Verify down projection <<<")
         loss_down, down_cpu = self.down_proj.verify_forward(
             gate_silu_x_up_cpu, down)
+        down = self.down_proj.add_bias(down)
 
         self.down_proj.verify_event.synchronize()
         self.event_ed.record(self.stream_cpu)
@@ -322,7 +325,6 @@ def test_mlp(itern, batch, seq_len, config: LlamaConfig):
 if __name__ == "__main__":
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
     config = LlamaConfig(model_name)
-    config.mlp_bias = False
     test_mlp(10, batch=1, seq_len=2048, config=config)
     # ll = {
     #    "batch" : [16, 32, 128, 256, 512, 1024, 2048, 4096, 8192 ,12384],

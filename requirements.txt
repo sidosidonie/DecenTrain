@@ -3,3 +3,4 @@ torch
 tabulate
 datasets
 accelerate
+torchmetrics
