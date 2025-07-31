@@ -94,6 +94,7 @@ def eager_attention_forward_verify(
         with torch.cuda.stream(st):
             # t2_cpu.st()
             # t2_0.st()
+            torch.cuda.synchronize()
             attn_weights_cpu, attn_event = copy_to_cpu(attn_weights, st)
             st.synchronize()
             # t2_0.ed()
@@ -138,6 +139,7 @@ def eager_attention_forward_verify(
     if not DISABLE_VERIFY:
         with torch.cuda.stream(st):
             g_logger.info(f"attn drop shape {attn_weights_drop.shape}")
+            torch.cuda.synchronize()
             final_out_cpu, _copy_e = copy_to_cpu(qkv, st)
             st.synchronize()
             loss = freivalds_algorithm(attn_weights_drop_cpu, value_states_cpu, final_out_cpu, st, e3=_copy_e)
@@ -218,8 +220,10 @@ class VerifyLlamaAttention(Module):
             with torch.cuda.stream(self.stream):
                 g_logger.info(f"Verify for q_project {hidden_states_cpu.shape=}, {query_states1.shape=}")
                 q_loss, query_states_cpu = self.q_proj.verify_forward_mm(hidden_states_cpu, query_states1)
+                query_states_cpu = self.q_proj.add_bias_cpu(query_states_cpu)
                 query_states_cpu = query_states_cpu.view(hidden_shape).transpose(1, 2)
 
+        query_states1 = self.q_proj.add_bias(query_states1)
         query_states = query_states1.view(hidden_shape).transpose(1, 2)
         torch.cuda.synchronize()
         #k_proj_time.ed()
@@ -231,8 +235,10 @@ class VerifyLlamaAttention(Module):
             with torch.cuda.stream(self.stream):
                 g_logger.info("Verify k_project")
                 k_loss, key_states_cpu = self.k_proj.verify_forward_mm(hidden_states_cpu, key_states1)
+                key_states_cpu = self.k_proj.add_bias_cpu(key_states_cpu)
                 key_states_cpu = key_states_cpu.view(hidden_shape).transpose(1, 2)
 
+        key_states1 = self.k_proj.add_bias(key_states1)
         key_states = key_states1.view(hidden_shape).transpose(1, 2)
         torch.cuda.synchronize()
         #v_proj_time.ed()
@@ -248,8 +254,11 @@ class VerifyLlamaAttention(Module):
             with torch.cuda.stream(self.stream):
                 g_logger.info("Verify k_project")
                 v_loss, value_states_cpu = self.v_proj.verify_forward_mm(hidden_states_cpu, value_states1)
+                value_states_cpu = self.v_proj.add_bias_cpu(value_states_cpu)
                 value_states_cpu = value_states_cpu.view(hidden_shape).transpose(1, 2)
                 query_states_cpu, key_states_cpu = apply_rotary_pos_emb(query_states_cpu, key_states_cpu, cos_cpu, sin_cpu, unsqueeze_dim=1)
+
+        value_states1 = self.v_proj.add_bias(value_states1)
 
         if DISABLE_VERIFY:
             query_states_cpu = None
