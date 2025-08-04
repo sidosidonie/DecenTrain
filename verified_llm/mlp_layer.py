@@ -9,15 +9,15 @@ from transformers.activations import ACT2FN
 from torch import Tensor
 import math
 import time
-from verified_training.verify_linear import VerifyLinear, copy_to_cpu
+from verified_llm.verify_linear import VerifyLinear, copy_to_cpu
 from torch.nn import functional as F, init
 from torch.nn import Linear, Module, Parameter
 from torch.autograd import Function
 import torch
 import sys
 import os
-from verified_training.utils.log_utils import g_logger
-from verified_training.utils.profiler import Profiler, Duration
+from verified_llm.utils.log_utils import g_logger
+from verified_llm.utils.profiler import Profiler, Duration
 from torch import nn
 
 # Get the absolute path of the current file
@@ -121,6 +121,7 @@ class LlamaMLPVerify(torch.nn.Module):
         self.gate_proj = VerifyLinear(origin.gate_proj, stream_cpu, stream_gpu)
         self.up_proj = VerifyLinear(origin.up_proj, stream_cpu, stream_gpu)
         self.down_proj = VerifyLinear(origin.down_proj, stream_cpu, stream_gpu)
+
         self.stream_cpu = stream_cpu
         self.stream_gpu = stream_gpu
         self.event_st = torch.cuda.Event(enable_timing=True, blocking=True)
@@ -176,169 +177,3 @@ class LlamaMLPVerify(torch.nn.Module):
         # return down, down_cpu, t
         g_logger.info("==== Verify MLP Done ====")
         return down
-
-
-def llama_mlp_test(iter=100, batch=1024):
-    prof = Profiler("log")
-    p1 = prof.add_time_span("original_mlp")
-    p2 = prof.add_time_span("verify_mlp")
-
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    config = LlamaConfig(model_name)
-    config.mlp_bias = False
-    print(config)
-
-    time.sleep(0.1)
-    mlp = LlamaMLP(config)
-    mlp.to("cuda")
-
-    x = torch.randn(batch, config.hidden_size,
-                    device="cuda", requires_grad=True)
-    total_origin = 0
-    total_verify = 0
-    e_st = torch.cuda.Event(enable_timing=True)
-    e_ed = torch.cuda.Event(enable_timing=True)
-
-    for i in range(iter):
-        g_logger.info("###########################")
-        torch.cuda.synchronize()
-        e_st.record()
-        t, ver_mlp, ver_mlp_cpu = llama_mlp(
-            batch, config.hidden_size, config.intermediate_size, x, mlp.gate_proj, mlp.up_proj, mlp.down_proj, p2)
-        torch.cuda.synchronize()
-        e_ed.record()
-        if i < 5:
-            continue
-        else:
-            total_verify += t
-
-    verify_time = total_verify / (iter-5)
-    print("Verified time: ", verify_time)
-
-    for i in range(iter):
-        g_logger.info("###########################")
-
-        torch.cuda.synchronize()
-        e_st.record()
-        y = mlp(x)
-        torch.cuda.synchronize()
-        e_ed.record()
-
-        time.sleep(0.1)
-
-        t = e_st.elapsed_time(e_ed)
-        if i >= 5:
-            total_origin += t
-
-    origin_time = total_origin / (iter-5)
-    print("Origin time: ", origin_time)
-    # origin = prof.dur_dict()["original_mlp"]["0-1"]
-    # verify = prof.dur_dict()["verify_mlp"]["0-1"]
-    g_logger.info(
-        f"Origin: {origin_time}, Verify: {verify_time} Overhead: {(verify_time - origin_time) / origin_time}")
-
-    return (origin_time, verify_time, (verify_time - origin_time) / origin_time)
-
-
-def gpu_cpu_modeul(batch=4, in_feat=2, out_feat=3):
-    torch.cuda.init()
-    l1 = LinearWithMM(in_features=in_feat, out_features=out_feat, bias=None)
-    l2 = LinearWithMM(in_features=out_feat, out_features=in_feat, bias=None)
-    v1 = VerifyLinear(l1)
-    v2 = VerifyLinear(l2)
-
-    l1.to("cuda")
-    l1.train
-    l2.to("cuda")
-    l2.train
-
-    # make input
-    x_cpu = torch.randn(batch, in_feat, requires_grad=True)
-    x_gpu = x_cpu.to("cuda")
-    x_gpu.requires_grad_(True)
-
-    out_grad = torch.randn(batch, in_feat, device="cuda", requires_grad=True)
-    out_grad_cpu = out_grad.to("cpu")
-    out_grad_cpu.requires_grad_(True)
-    out_grad_cpu.retain_grad()
-
-    with torch.enable_grad():
-        # y_cpu = l1(x_cpu)
-        y1_gpu = l1(x_gpu)
-        y1_gpu.retain_grad()
-        # y_cpu = v1(x_cpu, y_gpu)
-        y1_cpu = v1.forward(x_cpu, y1_gpu)
-
-        y2_gpu = l2(y1_gpu)
-        y2_gpu.retain_grad()
-        y2_cpu = v2.forward(y1_cpu, y2_gpu)
-        y2_cpu.retain_grad()
-
-        y2_gpu.backward(out_grad, retain_graph=True)
-
-        grad = (out_grad_cpu, y1_gpu.grad, l2.weight.grad)
-        g_logger.info(grad)
-
-        grad_in_cpu, grad_w2_cpu = v2.backward(
-            out_grad_cpu, y1_gpu.grad, l2.weight.grad)
-
-        y1_cpu.grad = grad_in_cpu
-        v2.weight.grad = grad_w2_cpu
-
-        g_logger.info(y1_cpu.grad)
-
-    # y_cpu.backward(gradient = final_grad, inputs = [x_gpu.grad, linear_gpu.weight.grad])
-
-
-def test_mlp(itern, batch, seq_len, config: LlamaConfig):
-    mlp = LlamaMLP(config)
-    mlp.to("cuda")
-    vmlp = LlamaMLPVerify(mlp, torch.cuda.Stream(), torch.cuda.Stream())
-
-    x = torch.randn(batch * seq_len, config.hidden_size,
-                    device="cuda", requires_grad=False)
-    x_cpu = x.clone().to("cpu")
-
-    total_verify = 0
-    total_origin = 0
-    for i in range(itern):
-        vmlp.stream_cpu.synchronize()
-        vmlp.stream_gpu.synchronize()
-
-        out, out_cpu, verify_time = vmlp.forward(x, x_cpu)
-
-        st_ori = torch.cuda.Event(enable_timing=True, blocking=True)
-        ed_ori = torch.cuda.Event(enable_timing=True, blocking=True)
-
-        st_ori.record()
-        out_origin = mlp(x)
-        ed_ori.record()
-        torch.cuda.synchronize()
-        t_origin = st_ori.elapsed_time(ed_ori)
-        g_logger.info(
-            f"Iteration {i+1}/{itern}, Verify Time: {verify_time} ms, Origin Time taken: {t_origin} ms")
-
-        diff = F.mse_loss(out, out_origin)
-        g_logger.info(f"Iteration {i+1}/{itern}, MSE Loss: {diff.item()}")
-
-
-if __name__ == "__main__":
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    config = LlamaConfig(model_name)
-    test_mlp(10, batch=1, seq_len=2048, config=config)
-    # ll = {
-    #    "batch" : [16, 32, 128, 256, 512, 1024, 2048, 4096, 8192 ,12384],
-    #    "origin" : [],
-    #    "verify" : [],
-    #    "overhead" : []
-    # }
-    # for b in [16, 32, 128, 256, 512, 1024, 2048, 4096]:
-    # for b in ll["batch"]:
-    #    origin, verify, overhead = llama_mlp_test(iter=100, batch=b)
-    #    ll["origin"].append(origin)
-    #    ll["verify"].append(verify)
-    #    ll["overhead"].append(overhead)
-
-    # df = pd.DataFrame(ll)
-    # print(df)
-    # print(df.to_markdown())

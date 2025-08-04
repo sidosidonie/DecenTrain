@@ -2,7 +2,7 @@ import torch
 import time
 import numpy as np
 from torch.nn import functional as F, init
-from verified_training.verification import freivalds_algorithm
+from verified_llm.verification import freivalds_algorithm
 
 
 def verify(dev, m, n, k):

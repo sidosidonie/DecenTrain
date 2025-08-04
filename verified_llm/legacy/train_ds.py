@@ -1,9 +1,9 @@
 import torch
 from torch.optim import AdamW
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from verified_training.utils.log_utils import g_logger
-from verified_training.utils.profiler import *
-from verified_training.llm_model import *
+from verified_llm.utils.log_utils import g_logger
+from verified_llm.utils.profiler import *
+from verified_llm.llm_model import *
 import deepspeed
 
 class Train:

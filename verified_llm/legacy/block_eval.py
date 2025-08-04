@@ -1,7 +1,7 @@
 import torch
 from torch.nn import Linear
-from verified_training.verification import freivalds_algorithm
-from verified_training.utils.profiler import Profiler
+from verified_llm.verification import freivalds_algorithm
+from verified_llm.utils.profiler import Profiler
 from torch.optim import AdamW
 from pprint import pprint
 import seaborn

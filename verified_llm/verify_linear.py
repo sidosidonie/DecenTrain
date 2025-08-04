@@ -1,21 +1,129 @@
-import sys
-import os
-from torch.autograd import Function
 from torch.nn import Linear, Module, Parameter
 from torch.nn import functional as F, init
-from verified_training.verification import time_profile, freivalds_algorithm
-import time
 import math
 import pandas as pd
-from torch.utils.data import DataLoader, TensorDataset
 import torch
 from torch import Tensor
-from verified_training.utils.log_utils import g_logger
+from verified_llm.utils.log_utils import g_logger
+
+class GlobRandomVec:
+
+    def __init__(self):
+        self.vec = {}
+
+    def get_key(self, n, k, dtype):
+        return f"{n}-{k}-{dtype}"
+
+    def get_or_create_vec(self, n, k, dtype):
+        key = self.get_key(n, k, dtype)
+        if key in self.vec.keys():
+            return self.vec[key]
+        else:
+            r_vec = torch.randn((n, k), dtype=dtype, device="cpu")
+            print("Create rand vec " + key)
+            self.vec[key] = r_vec
+            return self.vec[key]
+
+glob_random_vec = GlobRandomVec()
+
+def freivalds_algorithm_linear(A, B, C, k=10):
+    n = C.shape[-1]
+    r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
+    # print(f"{r.shape=}")
+    # r = torch.randn((n, k), dtype=torch.float16, device=A.device)
+    # Br = F.linear(B, r)
+    # ABr = F.linear(A, Br)
+    # Cr = F.linear(C, r)
+    Br = torch.mm(B, r)
+    ABr = torch.mm(A, Br)
+    Cr = torch.mm(C, r)
+
+    ret = F.mse_loss(ABr, Cr).item()
+    if ret > 1:
+        print(f"freivalds_algorithm: {ret=}")
+        print(f"Cr = {Cr}")
+        print(f"ABr = {ABr}")
+        exit(-1)
+    return ret
+
+def verify_attn_weight_freivalds(q, k, attn_weight, stream, k_freivalds=10):
+    """
+    q: [batch, head, seq_len, dim]
+    k: [batch, head, dim, seq_len]
+    attn_weight: [batch, head, seq_len, seq_len]
+    """
+    batch, head, seq_len_q, dim = q.shape
+    _, _, seq_len_k, _ = k.shape
+
+    # Transpose k for matmul: [batch, head, dim, seq_len_k]
+
+    losses = []
+    for b in range(batch):
+        for h in range(head):
+            # q[b, h]: [dim, seq_len_q], k_t[b, h]: [dim, seq_len_k], attn_weight[b, h]: [seq_len_q, seq_len_k]
+            loss = freivalds_algorithm(
+                q[b, h], k[b, h], attn_weight[b, h], stream, k=k_freivalds
+            )
+            losses.append(loss)
+    avg_loss = sum(losses) / len(losses) if losses else 0.0
+    return avg_loss
+
+def freivalds_algorithm(A, B, C, stream, e1=None, e2=None, e3=None, k=10):
+    print(f"{A.shape=}, {A.device}")
+    print(f"{B.shape=}, {B.device}")
+    print(f"{C.shape=}, {C.device}")
+    with torch.cuda.stream(stream):
+        n = C.shape[-1]
+        r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
+        # r = torch.randn((n, k), dtype=torch.float16, device=A.device)
+        if len(A.shape) > 2:
+            # change A from (n, n, k) to (n*n, k)
+            # A = A.reshape(-1, A.shape[-1])
+            # B = B.reshape(-1, B.shape[-1])
+            # C = C.reshape(-1, C.shape[-1])
+            if e2 is not None:
+                e2.synchronize()
+            Br = torch.matmul(B, r)
+
+            if e1 is not None:
+                e1.synchronize()
+            ABr = torch.matmul(A, Br)
+
+            if e3 is not None:
+                e3.synchronize()
+            Cr = torch.matmul(C, r)
+        else:
+            if e2 is not None:
+                e2.synchronize()
+            Br = torch.mm(B, r)
+
+            if e1 is not None:
+                e1.synchronize()
+            ABr = torch.mm(A, Br)
+
+            if e3 is not None:
+                e3.synchronize()
+
+            Cr = torch.mm(C, r)
+
+        ret = F.mse_loss(ABr, Cr).item()
+        if ret > 1:
+            print(f"freivalds_algorithm: {ret=}")
+            print(f"Given C {C.shape} = {C}")
+            print(f"Given A {A.shape} = {A}")
+            print(f"Given B {B.shape} = {B}")
+            print(f"cpu C = {torch.mm(A, B)}")
+            print("Close: ", torch.allclose(C, torch.mm(A, B)))
+            exit(-1)
+        return ret
+    # if not torch.allclose(ABr, Cr):
+    #    ret = F.mse_loss(ABr, Cr).item()
+    # return ret
 
 def copy_to_cpu(x_device: torch.Tensor, stream_copy):
     if x_device.is_cuda:
         x_host = torch.empty_like(x_device, device="cpu", pin_memory=True, dtype=x_device.dtype)
-        e = torch.cuda.Event(blocking=True)
+        e = torch.cuda.Event()
         with torch.cuda.stream(stream_copy):
             x_host.copy_(x_device, non_blocking=True)
             e.record(stream_copy)
@@ -70,7 +178,7 @@ class VerifyLinear:
         self.weight = linear.weight.clone().to("cpu")
         self.weight_t = self.weight.t() 
         self.linear = linear
-        if self.linear.bias:
+        if self.linear.bias is not None:
             self.bias_cpu = linear.bias.clone().to("cpu")
             
         self.ctx = []
@@ -81,34 +189,22 @@ class VerifyLinear:
 
     def forward(self, input):
         with torch.cuda.stream(self.gpu_stream):
-            out = self.linear(input)
+            out = F.linear(input, self.linear.weight, bias=None)
             self.compute_event.record(self.gpu_stream)
             return out
 
     def add_bias(self, input):
-        if self.linear.bias:
-            with torch.cuda.stream(self.gpu_stream):
-                return input + self.linear.bias
+        if self.linear.bias is not None:
+            return input + self.linear.bias
         else:
             return input
 
     def add_bias_cpu(self, input):
-        if self.linear.bias:
+        if self.linear.bias is not None:
             with torch.cuda.stream(self.cpu_stream):
                 return input + self.bias_cpu
         else:
             return input
-
-    def verify_forward_mm(self, input_from_gpu, output_from_gpu):
-        self.compute_event.synchronize()
-        with torch.cuda.stream(self.cpu_stream):
-            input_cpu, e1 = copy_to_cpu(input_from_gpu, self.cpu_stream)
-            # stack input
-            self.ctx.append(input_cpu)
-            output_cpu, e2 = copy_to_cpu(output_from_gpu, self.cpu_stream)
-            loss = freivalds_algorithm(input_cpu, self.weight_t, output_cpu, self.cpu_stream, e1, None, e2)
-            self.verify_event.record(self.cpu_stream)
-            return loss, output_cpu
 
     def verify_forward(self, input_from_gpu, output_from_gpu):
         self.compute_event.synchronize()
@@ -163,4 +259,4 @@ def test_verify(batch, hidden, inter):
     pass
 
 if __name__ == "__main__":
-    test_verify(1024, 4096, 8192)
+    test_verify(32, 64, 128)

@@ -1,6 +1,6 @@
 import torch
-from verified_training.mlp_layer import copy_to_cpu, freivalds_algorithm, freivalds_algorithm_linear
-from verified_training.utils.profiler import Profiler, Duration
+from verified_llm.mlp_layer import copy_to_cpu, freivalds_algorithm, freivalds_algorithm_linear
+from verified_llm.utils.profiler import Profiler, Duration
 from pprint import pprint
 import torch.cuda as cuda
 

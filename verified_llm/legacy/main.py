@@ -121,9 +121,9 @@ def train(model, dataloader, num_epochs, batch_size, use_deepspeed=True, use_hal
         print(f"Epoch {epoch + 1}, Loss: {loss.item()}")
 
 
-from verified_training.train import *
-from verified_training.llm_model import create_llm_model
-from verified_training.utils.log_utils import g_logger, logging
+from verified_llm.train import *
+from verified_llm.llm_model import create_llm_model
+from verified_llm.utils.log_utils import g_logger, logging
 import os
 
 def train_one_case(verify, use_ds=True, half=False, cpu_only=True, log="gpu.json"):
