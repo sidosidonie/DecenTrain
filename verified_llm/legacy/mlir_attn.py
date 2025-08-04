@@ -10,7 +10,7 @@ from torch_mlir.ir import *
 from torch_mlir.passmanager import PassManager
 from torch_mlir.extras import types 
 
-from verified_training.utils.log_utils import g_logger
+from verified_llm.utils.log_utils import g_logger
 
 def get_num_elem(t : RankedTensorType):
     """

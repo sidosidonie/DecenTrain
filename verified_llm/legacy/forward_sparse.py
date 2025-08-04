@@ -1,4 +1,4 @@
-from verified_training.utils.dataset_utils import get_c4_datasets
+from verified_llm.utils.dataset_utils import get_c4_datasets
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from torch.nn import functional as F, init

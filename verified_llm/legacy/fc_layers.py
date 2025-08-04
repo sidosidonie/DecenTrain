@@ -9,15 +9,15 @@ from transformers.activations import ACT2FN
 from torch import Tensor
 import math
 import time
-from verified_training.verification import time_profile, freivalds_algorithm, freivalds_algorithm_linear
+from verified_llm.verification import time_profile, freivalds_algorithm, freivalds_algorithm_linear
 from torch.nn import functional as F, init
 from torch.nn import Linear, Module, Parameter
 from torch.autograd import Function
 import torch
 import sys
 import os
-from verified_training.utils.log_utils import g_logger
-from verified_training.utils.profiler import Profiler, Duration
+from verified_llm.utils.log_utils import g_logger
+from verified_llm.utils.profiler import Profiler, Duration
 
 # Get the absolute path of the current file
 current_file_path = os.path.abspath(__file__)
