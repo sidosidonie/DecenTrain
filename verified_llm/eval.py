@@ -10,6 +10,7 @@ from fire import Fire
 import os
 import numpy as np
 import logging
+from pprint import pprint
 
 g_logger.setLevel(logging.INFO)
 
@@ -75,17 +76,18 @@ def generate(prompt, verify, dump = False):
     if dump:
         layer_outputs, hooks = dump_layer_outputs(model_verify)
 
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+    tokenizer.pad_token = tokenizer.eos_token
+    input_ids = tokenizer(prompt, return_tensors="pt", padding=True).input_ids.cuda()
     with torch.no_grad():
         st = torch.cuda.Event(enable_timing=True)
         ed = torch.cuda.Event(enable_timing=True)
 
         st.record()
-        out_toks = model_verify.generate(input_ids, max_new_tokens=100, do_sample=False)
+        out_toks = model_verify.generate(input_ids, max_new_tokens=10, do_sample=False, temperature=0.1)
         ed.record()
         total_time = st.elapsed_time(ed)
 
-        generated_text = tokenizer.decode(out_toks[0], skip_special_tokens=True)
+        generated_text = tokenizer.batch_decode(out_toks, skip_special_tokens=True)
         return generated_text, total_time
 
 def eval(batch = 8, seqlen = 1024):
@@ -99,12 +101,19 @@ def eval(batch = 8, seqlen = 1024):
     eval_metrics(model, tokenizer, data)
 
 if __name__ == "__main__":
-    prompt = "Once upon a time"
+    prompts = [
+    "Once upon a time, there was",
+    "In a future world ruled by AI,",
+    "The recipe for the perfect cake is" 
+    ]
     len = 1024*3
-    gen_text_ori, time_ori = generate(prompt, False, False)
-    print(f">>> Origin generated text: {gen_text_ori}, use time: {time_ori} ms")
-    gen_text_ver, time_ver = generate(prompt, True, False)
-    print(f">>> Verify generated text: {gen_text_ver}, use time: {time_ver} ms")
+    gen_text_ori, time_ori = generate(prompts, True, False)
+    print(f"Origin generation time: {time_ori} ms")
+    for gen_text in gen_text_ori:
+        print(f">>> Origin generated text: {gen_text}")
+
+    #gen_text_ver, time_ver = generate(prompt, True, False)
+    #print(f">>> Verify generated text: {gen_text_ver}, use time: {time_ver} ms")
 
     #gen_text_ver, time_ver = forward(len, True)
     #print(f"Verify: {time_ver}ms")

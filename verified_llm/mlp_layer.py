@@ -138,32 +138,26 @@ class LlamaMLPVerify(torch.nn.Module):
             return out
 
     def forward(self, x_gpu):
-        g_logger.info("==== Verify MLP ====")
         # Issue all GPU kernels
-        g_logger.info("==== GPU Gate, act and up ====")
         self.event_st.record(self.stream_cpu)
         gate = self.gate_proj.forward(x_gpu)
         gate_bias = self.gate_proj.add_bias(gate)
         gate_silu = self.act(gate_bias, self.stream_gpu)
         up = self.up_proj.forward(x_gpu)
         up_bias = self.up_proj.add_bias(up)
-        g_logger.info(">>> Verify gate projection <<<")
         x_cpu, e_copy = copy_to_cpu(x_gpu, self.stream_cpu)
         e_copy.synchronize()
         loss_gate, gate_cpu = self.gate_proj.verify_forward(x_cpu, gate)
         gate_cpu = self.gate_proj.add_bias_cpu(gate_cpu)
         gate_silu_cpu = self.act(gate_cpu, self.stream_cpu)
 
-        g_logger.info(">>> Verify up projection <<<")
         loss_up, up_cpu = self.up_proj.verify_forward(x_cpu, up)
         up_cpu = self.up_proj.add_bias_cpu(up_cpu)
         gate_silu_x_up_cpu = self.mul(gate_silu_cpu, up_cpu, self.stream_cpu)
 
-        g_logger.info("=== GPU Mul, Down projection ===")
         gate_silu_x_up = self.mul(gate_silu, up_bias, self.stream_gpu)
         down = self.down_proj.forward(gate_silu_x_up)
 
-        g_logger.info(">>> Verify down projection <<<")
         loss_down, down_cpu = self.down_proj.verify_forward(
             gate_silu_x_up_cpu, down)
         down = self.down_proj.add_bias(down)
@@ -175,5 +169,4 @@ class LlamaMLPVerify(torch.nn.Module):
         g_logger.info(
             f"Loss gate: {loss_gate}, Loss up: {loss_up}, Loss down: {loss_down}")
         # return down, down_cpu, t
-        g_logger.info("==== Verify MLP Done ====")
         return down

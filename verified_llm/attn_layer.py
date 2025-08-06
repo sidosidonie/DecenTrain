@@ -12,7 +12,7 @@ from transformers.activations import ACT2FN
 from torch import Tensor
 import math
 import time
-from verified_llm.verify_linear import freivalds_algorithm, verify_attn_weight_freivalds
+from verified_llm.verify_linear import freivalds_algorithm, freivalds_batch_matmul
 from torch.nn import functional as F, init
 from torch.nn import Linear, Module, Parameter
 from torch.autograd import Function
@@ -79,18 +79,15 @@ def eager_attention_forward_verify(
     # key_rep, key_rep_cpu
     key_states = repeat_kv(key, module.num_key_value_groups)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3))
-    attn_weights_current = attn_weights
-    g_logger.info(f"current attn_weights shape {attn_weights.shape}")
     torch.cuda.synchronize()  # sync gpu attn
     # before_attn.ed()
 
-    g_logger.info(f"Before attn_weights shape {attn_weights.shape}")
-
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-
+        attn_weights_mask = attn_weights + causal_mask
+    else:
+        causal_mask = None
+        attn_weights_mask = attn_weights
 
     # ================================
     # t2.st()
@@ -100,33 +97,30 @@ def eager_attention_forward_verify(
             # t2_0.st()
             torch.cuda.synchronize()
             g_logger.info(f"While verify attn_weights shape {attn_weights.shape}")
-            attn_weights_cpu, attn_event = copy_to_cpu(attn_weights, st)
+            g_logger.info(f"Before copy attn to cpu {attn_weights=}")
+            attn_weights_cpu, _ = copy_to_cpu(attn_weights, st)
             st.synchronize()
-            # t2_0.ed()
+            g_logger.info(f"After copy attn to cpu {attn_weights_cpu=}")
 
-            #t2_2.st()
-            #attn_weights_cpu = torch.matmul(query_cpu, key_states_cpu)
-            #st.synchronize()
-            #t2_2.ed()
+            #cur_seq_len = key_states_cpu.shape[-1]
+            #attn_weights_current_cpu = attn_weights_cpu[:, :, :, 0:cur_seq_len]
 
-            # t2_1.st()
-            if attn_event is not None:
-                attn_event.synchronize()
-
-            g_logger.info(f"key shape {key_states_cpu.shape}")
-            g_logger.info(f"query shape {query_cpu.shape}")
-
-            cur_seq_len = key_states_cpu.shape[-1]
-            attn_weights_current = attn_weights_cpu[:, :, :, 0:cur_seq_len]
-
-            g_logger.info(f"attn_weights shape {attn_weights_current.shape}")
-            loss = verify_attn_weight_freivalds(query_cpu, key_states_cpu, attn_weights_current, st)
+            g_logger.info(f"qk verify shapes: {query_cpu.shape=}, {key_states_cpu.shape=}, {attn_weights_cpu.shape=}")
+            loss = freivalds_batch_matmul(query_cpu, key_states_cpu, attn_weights_cpu)
             g_logger.info(f"Q*K Verify loss: {loss}")
+            if loss > 1:
+                g_logger.info(f"{attn_weights_cpu=}")
+                g_logger.info(f"{query_cpu=}")
+                g_logger.info(f"{key_states_cpu=}")
+
             st.synchronize()
             # t2_1.ed()
+            if attention_mask is not None:
+                attn_weights_mask_cpu = attn_weights_cpu + causal_mask.cpu()
+            else:
+                attn_weights_mask_cpu = attn_weights_cpu
 
-            # t2_3.st()
-            attn_weights_scale_cpu = attn_weights_cpu * scaling
+            attn_weights_scale_cpu = attn_weights_mask_cpu * scaling
             attn_weights_scale_soft_cpu = F.softmax(attn_weights_scale_cpu, dim=-1, dtype=torch.float32).to(query.dtype)
             attn_weights_drop_cpu = F.dropout(attn_weights_scale_soft_cpu, p=dropout, training=module.training)
             st.synchronize()
@@ -135,7 +129,7 @@ def eager_attention_forward_verify(
 
     torch.cuda.synchronize()  # sync gpu attn
     # t2_gpu.st()
-    attn_weights_scale = attn_weights * scaling
+    attn_weights_scale = attn_weights_mask * scaling
     value_states = repeat_kv(value, module.num_key_value_groups)
     attn_weights_scale_soft = F.softmax(attn_weights_scale, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights_drop = F.dropout(attn_weights_scale_soft, p=dropout, training=module.training)
@@ -157,9 +151,11 @@ def eager_attention_forward_verify(
             g_logger.info(f"attn drop shape {attn_weights_drop.shape}")
             torch.cuda.synchronize()
             final_out_cpu, _copy_e = copy_to_cpu(qkv, st)
+            #attn_weights_drop_cpu_cur = attn_weights_drop_cpu[:, :, :, 0:cur_seq_len]
+            #loss = freivalds_algorithm(attn_weights_drop_cpu_cur, value_states_cpu, final_out_cpu, st, e3=_copy_e)
             st.synchronize()
-            attn_weights_drop_cpu_cur = attn_weights_drop_cpu[:, :, :, 0:cur_seq_len]
-            loss = freivalds_algorithm(attn_weights_drop_cpu_cur, value_states_cpu, final_out_cpu, st, e3=_copy_e)
+            loss = freivalds_batch_matmul(attn_weights_drop_cpu, value_states_cpu, final_out_cpu)
+            g_logger.info(f"Final output Verify loss: {loss}")
 
     torch.cuda.synchronize()
     #t3.ed()
@@ -213,8 +209,6 @@ class LlamaAttentionVerify(Module):
         #inputs_cpu, event_copy_input = copy_to_cpu(inputs_gpu, self.stream)
         #hidden_states, position = inputs_gpu
 
-        g_logger.warning(f"Attention mask {attention_mask.shape if attention_mask is not None else None}")
-
         cos, sin = position_embeddings[0], position_embeddings[1]
         hidden_states_cpu, event_hidden = copy_to_cpu(hidden_states, self.stream_cpu)
         cos_cpu, e_cos = copy_to_cpu(cos, self.stream_cpu)
@@ -236,7 +230,6 @@ class LlamaAttentionVerify(Module):
         if not DISABLE_VERIFY:
             event_hidden.synchronize()
             with torch.cuda.stream(self.stream_cpu):
-                g_logger.info(f"Verify for q_project {hidden_states_cpu.shape=}, {query_states1.shape=}")
                 q_loss, query_states_cpu = self.q_proj.verify_forward(hidden_states_cpu, query_states1)
                 g_logger.info(f"Q Verify loss: {q_loss}")
                 query_states_cpu = self.q_proj.add_bias_cpu(query_states_cpu)
@@ -252,7 +245,6 @@ class LlamaAttentionVerify(Module):
         value_states1 = self.v_proj.forward(hidden_states)
         if not DISABLE_VERIFY:
             with torch.cuda.stream(self.stream_cpu):
-                g_logger.info("Verify k_project")
                 k_loss, key_states_cpu = self.k_proj.verify_forward(hidden_states_cpu, key_states1)
                 g_logger.info(f"K Verify loss: {k_loss}")
                 key_states_cpu = self.k_proj.add_bias_cpu(key_states_cpu)
@@ -272,7 +264,6 @@ class LlamaAttentionVerify(Module):
 
         if not DISABLE_VERIFY:
             with torch.cuda.stream(self.stream_cpu):
-                g_logger.info("Verify k_project")
                 v_loss, value_states_cpu = self.v_proj.verify_forward(hidden_states_cpu, value_states1)
                 g_logger.info(f"V Verify loss: {v_loss}")
                 value_states_cpu = self.v_proj.add_bias_cpu(value_states_cpu)
@@ -292,7 +283,12 @@ class LlamaAttentionVerify(Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        g_logger.info(f"Attention stream {self.stream_cpu}")
+            if not DISABLE_VERIFY:
+                key_states_cpu, _e1 = copy_to_cpu(key_states, self.stream_cpu)
+                value_states_cpu, _e2 = copy_to_cpu(value_states, self.stream_cpu)
+                _e1.synchronize()
+                _e2.synchronize()
+
         attn_output, attn_weights = eager_attention_forward_verify(
             self.stream_cpu,
             self,
