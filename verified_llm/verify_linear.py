@@ -46,28 +46,6 @@ def freivalds_algorithm_linear(A, B, C, k=10):
         exit(-1)
     return ret
 
-def verify_attn_weight_freivalds(q, k, attn_weight, stream, k_freivalds=10):
-    """
-    q: [batch, head, seq_len, dim]
-    k: [batch, head, dim, seq_len]
-    attn_weight: [batch, head, seq_len, seq_len]
-    """
-    batch, head, seq_len_q, dim = q.shape
-    _, _, seq_len_k, _ = k.shape
-
-    # Transpose k for matmul: [batch, head, dim, seq_len_k]
-
-    losses = []
-    for b in range(batch):
-        for h in range(head):
-            # q[b, h]: [dim, seq_len_q], k_t[b, h]: [dim, seq_len_k], attn_weight[b, h]: [seq_len_q, seq_len_k]
-            loss = freivalds_algorithm(
-                q[b, h], k[b, h], attn_weight[b, h], stream, k=k_freivalds
-            )
-            losses.append(loss)
-    avg_loss = sum(losses) / len(losses) if losses else 0.0
-    return avg_loss
-
 def freivalds_batch_matmul(A, B, C, k=10):
     g_logger.info(f"freivalds_batch_matmul: {A.shape=}, {B.shape=}, {C.shape=}")
     assert A.device == B.device == C.device, "All tensors must be on the same device"
@@ -77,6 +55,7 @@ def freivalds_batch_matmul(A, B, C, k=10):
     ABr = torch.matmul(A, Br)
     Cr = torch.matmul(C, r)
     loss = F.mse_loss(ABr, Cr).item()
+    assert loss < 1e-5 or f"Freivalds' algorithm failed with loss {loss}"
     return loss
 
 def freivalds_algorithm(A, B, C, stream, e1=None, e2=None, e3=None, k=10):
@@ -115,6 +94,7 @@ def freivalds_algorithm(A, B, C, stream, e1=None, e2=None, e3=None, k=10):
             Cr = torch.mm(C, r)
 
         ret = F.mse_loss(ABr, Cr).item()
+        assert ret < 1e-5 or f"Freivalds' algorithm failed with loss {ret}"
         if ret > 1:
             print(f"freivalds_algorithm: {ret=}")
             print(f"Given C {C.shape} = {C}")
