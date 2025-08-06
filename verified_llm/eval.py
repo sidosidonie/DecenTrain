@@ -77,30 +77,30 @@ def generate(prompt, verify, dump = False):
         layer_outputs, hooks = dump_layer_outputs(model_verify)
 
     tokenizer.pad_token = tokenizer.eos_token
-    input_ids = tokenizer(prompt, return_tensors="pt", padding=True).input_ids.cuda()
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
     with torch.no_grad():
         st = torch.cuda.Event(enable_timing=True)
         ed = torch.cuda.Event(enable_timing=True)
 
         st.record()
-        out_toks = model_verify.generate(input_ids, max_new_tokens=10, do_sample=False, temperature=0.1)
+        out_toks = model_verify.generate(inputs.input_ids.cuda(), max_new_tokens=10, do_sample=False, temperature=0.1)
         ed.record()
         total_time = st.elapsed_time(ed)
 
         generated_text = tokenizer.batch_decode(out_toks, skip_special_tokens=True)
         return generated_text, total_time
 
-def eval(batch = 8, seqlen = 1024):
+def eval(verify=False, batch = 4, seqlen = 1024):
     model_path = "meta-llama/Llama-3.2-1B-Instruct"
     cpu_stream = torch.cuda.Stream()
     gpu_stream = torch.cuda.default_stream()
     model = create_llm_model("meta-llama/Llama-3.2-1B-Instruct",
-                             verify=False, cpu=cpu_stream, gpu=gpu_stream)
+                             verify=verify, cpu=cpu_stream, gpu=gpu_stream)
     data = get_c4_datasets("meta-llama/Llama-3.2-1B-Instruct", batch, seqlen, "train")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     eval_metrics(model, tokenizer, data)
 
-if __name__ == "__main__":
+def generate_main():
     prompts = [
     "Once upon a time, there was",
     "In a future world ruled by AI,",
@@ -118,3 +118,6 @@ if __name__ == "__main__":
     #gen_text_ver, time_ver = forward(len, True)
     #print(f"Verify: {time_ver}ms")
     #print(f"Origin: {time_ori}ms")
+
+if __name__ == "__main__":
+    eval()

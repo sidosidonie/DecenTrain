@@ -96,23 +96,14 @@ def eager_attention_forward_verify(
             # t2_cpu.st()
             # t2_0.st()
             torch.cuda.synchronize()
-            g_logger.info(f"While verify attn_weights shape {attn_weights.shape}")
-            g_logger.info(f"Before copy attn to cpu {attn_weights=}")
             attn_weights_cpu, _ = copy_to_cpu(attn_weights, st)
             st.synchronize()
-            g_logger.info(f"After copy attn to cpu {attn_weights_cpu=}")
 
             #cur_seq_len = key_states_cpu.shape[-1]
             #attn_weights_current_cpu = attn_weights_cpu[:, :, :, 0:cur_seq_len]
 
             g_logger.info(f"qk verify shapes: {query_cpu.shape=}, {key_states_cpu.shape=}, {attn_weights_cpu.shape=}")
             loss = freivalds_batch_matmul(query_cpu, key_states_cpu, attn_weights_cpu)
-            g_logger.info(f"Q*K Verify loss: {loss}")
-            if loss > 1:
-                g_logger.info(f"{attn_weights_cpu=}")
-                g_logger.info(f"{query_cpu=}")
-                g_logger.info(f"{key_states_cpu=}")
-
             st.synchronize()
             # t2_1.ed()
             if attention_mask is not None:
@@ -173,7 +164,6 @@ class LlamaAttentionVerify(Module):
 
     def __init__(self, llama : LlamaAttention, st_cpu, st_gpu):
         super().__init__()
-        g_logger.warning(f"VerifyLlamaAttention init {st_cpu=}, {st_gpu=}")
         self.config = llama.config
         self.layer_idx = llama.layer_idx
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
