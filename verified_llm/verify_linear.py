@@ -68,10 +68,18 @@ def verify_attn_weight_freivalds(q, k, attn_weight, stream, k_freivalds=10):
     avg_loss = sum(losses) / len(losses) if losses else 0.0
     return avg_loss
 
+def freivalds_batch_matmul(A, B, C, k=10):
+    g_logger.info(f"freivalds_batch_matmul: {A.shape=}, {B.shape=}, {C.shape=}")
+    assert A.device == B.device == C.device, "All tensors must be on the same device"
+    n = C.shape[-1]
+    r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
+    Br = torch.matmul(B, r)
+    ABr = torch.matmul(A, Br)
+    Cr = torch.matmul(C, r)
+    loss = F.mse_loss(ABr, Cr).item()
+    return loss
+
 def freivalds_algorithm(A, B, C, stream, e1=None, e2=None, e3=None, k=10):
-    print(f"{A.shape=}, {A.device}")
-    print(f"{B.shape=}, {B.device}")
-    print(f"{C.shape=}, {C.device}")
     with torch.cuda.stream(stream):
         n = C.shape[-1]
         r = glob_random_vec.get_or_create_vec(n, k, A.dtype)

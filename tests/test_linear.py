@@ -1,4 +1,5 @@
 from verified_llm.mlp_layer import *
+from verified_llm.verify_linear import *
 from pytest import mark
 
 @mark.parametrize("batch, hidden, inter, bias", [
@@ -42,3 +43,30 @@ def test_mlp(batch):
     y = origin_mlp.forward(x)
     y_v = verify_mlp.forward(x)
     assert torch.allclose(y, y_v)
+
+
+@mark.parametrize("batch, seq_len, head_num, head_size", [
+    (1, 128, 8, 64),
+    (2, 64, 4, 32),
+    (4, 32, 2, 64), 
+    (8, 16, 1, 128),
+    (3, 32, 1, 64),
+])
+def test_freivalds_qk(batch, seq_len, head_num, head_size):
+    stream = torch.cuda.Stream()
+    q = torch.randn(batch, head_num, seq_len, head_size, device="cuda", requires_grad=False)
+    k = torch.randn(batch, head_num, head_size, seq_len, device="cuda", requires_grad=False)
+    qk = torch.matmul(q, k)
+    assert qk.device.type == "cuda"
+
+    q_cpu, _ = copy_to_cpu(q, stream)
+    k_cpu, _ = copy_to_cpu(k, stream)
+    qk_cpu, _ = copy_to_cpu(qk, stream)
+
+    stream.synchronize()
+
+    loss = freivalds_batch_matmul(q_cpu, k_cpu, qk_cpu)
+    assert loss < 1e-8, f"Freivalds verification failed with loss {loss}"
+
+    
+    
