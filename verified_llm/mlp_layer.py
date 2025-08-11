@@ -99,7 +99,7 @@ def llama_mlp(batch, hidden, inter, input_tensor, gate=None, up=None, down=None,
 
 class LlamaMLPVerify(torch.nn.Module):
 
-    def __init__(self, origin: LlamaMLP, stream_cpu: torch.cuda.Stream, stream_gpu: torch.cuda.Stream):
+    def __init__(self, origin: LlamaMLP, stream_cpu: torch.cuda.Stream, stream_gpu: torch.cuda.Stream, noise_scale):
         """
         gate = gate_proj(x) || up = up_proj(x)
         gate_cpu = copy_to_cpu(gate)
@@ -118,9 +118,9 @@ class LlamaMLPVerify(torch.nn.Module):
         return down_proj(silu(gate_proj(x)) * up_proj(x))
         """
         super().__init__()
-        self.gate_proj = VerifyLinear(origin.gate_proj, stream_cpu, stream_gpu)
-        self.up_proj = VerifyLinear(origin.up_proj, stream_cpu, stream_gpu)
-        self.down_proj = VerifyLinear(origin.down_proj, stream_cpu, stream_gpu)
+        self.gate_proj = VerifyLinear(origin.gate_proj, stream_cpu, stream_gpu, noise_scale)
+        self.up_proj = VerifyLinear(origin.up_proj, stream_cpu, stream_gpu, noise_scale)
+        self.down_proj = VerifyLinear(origin.down_proj, stream_cpu, stream_gpu, noise_scale)
 
         self.stream_cpu = stream_cpu
         self.stream_gpu = stream_gpu
@@ -148,25 +148,25 @@ class LlamaMLPVerify(torch.nn.Module):
         x_cpu, e_copy = copy_to_cpu(x_gpu, self.stream_cpu)
         e_copy.synchronize()
         loss_gate, gate_cpu = self.gate_proj.verify_forward(x_cpu, gate)
+        g_logger.info(f"MLP_gate loss: {loss_gate}")
         gate_cpu = self.gate_proj.add_bias_cpu(gate_cpu)
         gate_silu_cpu = self.act(gate_cpu, self.stream_cpu)
 
         loss_up, up_cpu = self.up_proj.verify_forward(x_cpu, up)
+        g_logger.info(f"MLP_up loss: {loss_up}")
         up_cpu = self.up_proj.add_bias_cpu(up_cpu)
         gate_silu_x_up_cpu = self.mul(gate_silu_cpu, up_cpu, self.stream_cpu)
 
         gate_silu_x_up = self.mul(gate_silu, up_bias, self.stream_gpu)
         down = self.down_proj.forward(gate_silu_x_up)
 
-        loss_down, down_cpu = self.down_proj.verify_forward(
-            gate_silu_x_up_cpu, down)
+        loss_down, down_cpu = self.down_proj.verify_forward(gate_silu_x_up_cpu, down)
+        g_logger.info(f"MLP_down loss: {loss_down}")
         down = self.down_proj.add_bias(down)
 
         self.down_proj.verify_event.synchronize()
         self.event_ed.record(self.stream_cpu)
 
         t = self.event_st.elapsed_time(self.event_ed)
-        g_logger.info(
-            f"Loss gate: {loss_gate}, Loss up: {loss_up}, Loss down: {loss_down}")
         # return down, down_cpu, t
         return down

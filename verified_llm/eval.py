@@ -90,7 +90,7 @@ def generate(prompt, verify, dump = False):
         generated_text = tokenizer.batch_decode(out_toks, skip_special_tokens=True)
         return generated_text, total_time
 
-def eval(verify=False, batch = 4, seqlen = 1024):
+def eval(verify=False, batch = 2, seqlen = 2048):
     model_path = "meta-llama/Llama-3.2-1B-Instruct"
     cpu_stream = torch.cuda.Stream()
     gpu_stream = torch.cuda.default_stream()
@@ -120,4 +120,4 @@ def generate_main():
     #print(f"Origin: {time_ori}ms")
 
 if __name__ == "__main__":
-    eval()
+    generate_main()
