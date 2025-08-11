@@ -1,43 +1,38 @@
 """
   Build llm models with verified linear
 """
-from torch.nn import Linear 
 from transformers import AutoModelForCausalLM
 from verified_llm.mlp_layer import LlamaMLPVerify, LlamaMLP
-from verified_llm.attn_layer import LlamaAttentionVerify , LlamaAttention, LlamaConfig
+from verified_llm.attn_layer import LlamaAttentionVerify , LlamaAttention
 from verified_llm.utils.log_utils import g_logger
 from verified_llm.utils.profiler import Profiler 
 import torch
-from torch.nn import functional as F, init
-from torch import Tensor
-from torch.nn.parameter import Parameter, UninitializedParameter
-import math
+import functools
 
-def replace_param_attn(origin : LlamaAttention, stream_cpu, stream_gpu):
-    new_linear = LlamaAttentionVerify(origin, stream_cpu, stream_gpu)
+def replace_param_attn(origin : LlamaAttention, stream_cpu, stream_gpu, noise):
+    new_linear = LlamaAttentionVerify(origin, stream_cpu, stream_gpu, noise)
     return new_linear
 
-def replace_attn(model, cpu, gpu):
+def replace_attn(model, cpu, gpu, noise):
     for name, module in model.named_children():
         if isinstance(module, LlamaAttention):
-            veri_mlp = replace_param_attn(module, cpu, gpu)
+            veri_mlp = replace_param_attn(module, cpu, gpu, noise)
             setattr(model, name, veri_mlp)
         else:
-            replace_attn(module, cpu, gpu)
+            replace_attn(module, cpu, gpu, noise)
 
-def replace_param_mlp(origin : LlamaMLP, stream_cpu, stream_gpu):
-    new_linear = LlamaMLPVerify(origin, stream_cpu, stream_gpu)
+def replace_param_mlp(origin : LlamaMLP, stream_cpu, stream_gpu, noise):
+    new_linear = LlamaMLPVerify(origin, stream_cpu, stream_gpu, noise)
     return new_linear
 
-def replace_mlp(model, cpu, gpu):
+def replace_mlp(model, cpu, gpu, noise):
     for name, module in model.named_children():
         if isinstance(module, LlamaMLP):
-            veri_mlp = replace_param_mlp(module, cpu, gpu)
+            veri_mlp = replace_param_mlp(module, cpu, gpu, noise)
             setattr(model, name, veri_mlp)
         else:
-            replace_mlp(module, cpu, gpu)
+            replace_mlp(module, cpu, gpu, noise)
 
-import functools
 
 def dump_layer_outputs(model):
     layer_outputs = {}
@@ -51,15 +46,15 @@ def dump_layer_outputs(model):
             hooks.append(module.register_forward_hook(functools.partial(hook_fn, name)))
     return layer_outputs, hooks
 
-def create_llm_model(model_path, verify=False, cpu=None, gpu=None):
+def create_llm_model(model_path, verify=False, cpu=None, gpu=None, noise=None):
     model = AutoModelForCausalLM.from_pretrained(model_path)
     model.config._attn_implementation = "eager"
     model.to("cuda")
     p = Profiler()
     dur = p.add_time_span("attn")
     if verify:
-        replace_attn(model, cpu, gpu)
-        replace_mlp(model, cpu, gpu)
+        replace_attn(model, cpu, gpu, noise)
+        replace_mlp(model, cpu, gpu, noise)
 
     return model
 
