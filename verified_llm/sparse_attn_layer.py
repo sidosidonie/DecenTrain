@@ -25,6 +25,23 @@ from verified_llm.verify_linear import VerifyLinear, copy_to_cpu, add_noise
 
 DISABLE_VERIFY = False
 
+def get_sparse_tensor_cap(t):
+    values_mem = t.values().element_size() * t.values().numel()
+    indices_mem = t.crow_indices().element_size() * t.crow_indices().numel()
+    col_indices_mem = t.col_indices().element_size() * t.col_indices().numel()
+    total_mem = values_mem + indices_mem + col_indices_mem
+    print(f"Estimated sparse tensor memory: {total_mem / 1024:.2f} KB")
+    print("Estimated dense tensor memory: {:.2f} KB".format(t.shape.numel() * t.element_size() / 1024))
+    return total_mem
+
+def gen_mask(attn_mask):
+    if attn_mask is None:
+        return attn_mask
+    x = attn_mask
+    x = torch.where(x == 0, torch.tensor(1., device=x.device, dtype=x.dtype), x)
+    x = torch.where(torch.isneginf(x), torch.tensor(0., device=x.device, dtype=x.dtype), x)
+    return x
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -70,6 +87,7 @@ def eager_attention_forward_verify(
     # t4 = prof.new("o_proj_verify")
 
     noise_scale = kwargs["noise_scale"] if "noise_scale" in kwargs else None
+    sliding_window_size = kwargs["sliding_window_size"] if "sliding_window_size" in kwargs else None
 
     if not DISABLE_VERIFY:
         with torch.cuda.stream(st):
@@ -81,39 +99,50 @@ def eager_attention_forward_verify(
     key_states = repeat_kv(key, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3))
-
     if not DISABLE_VERIFY:
         attn_weights = add_noise(attn_weights, noise_scale)
+
+    mask01 = gen_mask(attention_mask)
+
+    attn_weights = attn_weights * mask01
 
     torch.cuda.synchronize()  # sync gpu attn
     # before_attn.ed()
 
-    attn_weights_scale = attn_weights * scaling
-
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights_mask = attn_weights_scale + causal_mask
+        attn_weights_mask = attn_weights + causal_mask
     else:
         causal_mask = None
-        attn_weights_mask = attn_weights_scale
-
-
+        attn_weights_mask = attn_weights
 
     # ================================
     # t2.st()
     if not DISABLE_VERIFY:
+        e1 = torch.cuda.Event(enable_timing=True)
+        e2 = torch.cuda.Event(enable_timing=True)
+        e1.record()
+        attn_weights_sparse = attn_weights.to_sparse_csr()  # or .to_sparse() for COO format
+        e2.synchronize()
+        e2.record()
+        g_logger.info(f"====== Sparse convert time: {e1.elapsed_time(e2)} ms")
+
+        get_sparse_tensor_cap(attn_weights_sparse)
+
         with torch.cuda.stream(st):
             # t2_cpu.st()
             # t2_0.st()
-            torch.cuda.synchronize()
             e1 = torch.cuda.Event(enable_timing=True)
             e2 = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
             e1.record()
-            attn_weights_cpu, _ = copy_to_cpu(attn_weights, st)
+            attn_weights_cpu, _ = copy_to_cpu(attn_weights_sparse, st)
+            #attn_weights_cpu, _ = copy_to_cpu(attn_weights, st)
             st.synchronize()
             e2.record()
             g_logger.info(f"====== Copy to cpu time: {e1.elapsed_time(e2)} ms")
 
+            attn_weights_cpu = attn_weights_cpu.to_dense()
             #cur_seq_len = key_states_cpu.shape[-1]
             #attn_weights_current_cpu = attn_weights_cpu[:, :, :, 0:cur_seq_len]
 
@@ -135,8 +164,9 @@ def eager_attention_forward_verify(
 
     torch.cuda.synchronize()  # sync gpu attn
     # t2_gpu.st()
+    attn_weights_scale = attn_weights_mask * scaling
     value_states = repeat_kv(value, module.num_key_value_groups)
-    attn_weights_scale_soft = F.softmax(attn_weights_mask, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights_scale_soft = F.softmax(attn_weights_scale, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights_drop = F.dropout(attn_weights_scale_soft, p=dropout, training=module.training)
     qkv = torch.matmul(attn_weights_drop, value_states)
     if not DISABLE_VERIFY:
@@ -178,7 +208,7 @@ def eager_attention_forward_verify(
 class LlamaAttentionVerify(Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, llama : LlamaAttention, st_cpu, st_gpu, noise=None):
+    def __init__(self, llama : LlamaAttention, st_cpu, st_gpu, noise=None, sliding_window_size=None):
         super().__init__()
         self.config = llama.config
         self.layer_idx = llama.layer_idx
@@ -197,6 +227,7 @@ class LlamaAttentionVerify(Module):
         self.stream_cpu = st_cpu
         self.stream_gpu = st_gpu
         self.noise = noise
+        self.sliding_window_size = sliding_window_size
 
     def forward(
         self,
@@ -312,6 +343,50 @@ class LlamaAttentionVerify(Module):
             input_shape=input_shape,
             before_attn = None,
             noise_scale=self.noise,
+            sliding_window_size=self.sliding_window_size
         )
 
         return attn_output, attn_weights
+
+def sliding_window_mask(batch, head_dim, seq_len, window, device="cpu"):
+    # indices [L, L]
+    arange = torch.arange(seq_len, device=device)
+    diff = arange[:, None] - arange[None, :] 
+    # allow positions 0..window (causal + window)
+    mask = torch.where((diff >= 0) & (diff <= window), 0., float('-inf'))
+    # mask: [seq_len, seq_len]
+    mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+    mask = mask.expand(batch, head_dim, seq_len, seq_len)  # [batch, head_dim, seq_len, seq_len]
+    return mask
+
+def test_attn(batch, seq_len, noise_scale, sliding_window_size):
+    cpu_stream = torch.cuda.Stream()
+    gpu_stream = torch.cuda.Stream()
+    config = LlamaConfig("meta-llama/Llama-3.2-1B-Instruct")
+    config.hidden_size = 10
+    config.head_dim = 32
+    origin_attn = LlamaAttention(config, layer_idx=0).to("cuda")
+    verify_attn = LlamaAttentionVerify(origin_attn, cpu_stream, gpu_stream, noise_scale, sliding_window_size)
+
+    def gen_attn_inputs():
+        x = torch.randn(batch, seq_len, config.hidden_size, device="cuda", requires_grad=False)
+        cos = torch.randn(batch, seq_len, config.head_dim, device="cuda", requires_grad=False)
+        sin = torch.randn(batch, seq_len, config.head_dim, device="cuda", requires_grad=False)
+        position_ids = torch.stack([cos, sin], dim=0)
+        attention_mask = sliding_window_mask(batch, config.head_dim, seq_len, sliding_window_size, device="cuda")
+        return x, position_ids, attention_mask
+
+    x, position_ids, attention_mask = gen_attn_inputs()
+    #y = origin_attn.forward(hidden_states=x, position_embeddings=position_ids, attention_mask=attention_mask)
+    #exit(-1)
+    y_v = verify_attn.forward(x, position_embeddings=position_ids, attention_mask=attention_mask)
+
+    #if noise_scale is None:
+    #    assert torch.allclose(y[0], y_v[0])
+    #    assert torch.allclose(y[1], y_v[1])
+    #else:
+    #    assert torch.allclose(y[0], y_v[0], atol=1e-5)
+    #    assert torch.allclose(y[1], y_v[1], atol=1e-5)
+
+if __name__ == "__main__":
+    test_attn(1, 1024, None, 256)

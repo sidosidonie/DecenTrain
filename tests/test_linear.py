@@ -31,13 +31,18 @@ def test_linear(batch, hidden, inter, bias):
     assert loss < 1e-5, f"Verification failed with loss {loss}"
 
 
-@mark.parametrize("batch", [1, 2, 4, 8])
-def test_mlp(batch):
+@mark.parametrize("batch, noise_scale", [
+    (1, 1e-9 ),
+    (2, 1e-9),
+    (4, 1e-9),
+    (8, 1e-9),
+])
+def test_mlp(batch, noise_scale):
     cpu_stream = torch.cuda.Stream()
     gpu_stream = torch.cuda.Stream()
     config = LlamaConfig("meta-llama/Llama-3.2-1B-Instruct")
     origin_mlp = LlamaMLP(config).to("cuda")
-    verify_mlp = LlamaMLPVerify(origin_mlp, cpu_stream, gpu_stream)
+    verify_mlp = LlamaMLPVerify(origin_mlp, cpu_stream, gpu_stream, noise_scale)
 
     x = torch.randn(batch, config.hidden_size, device="cuda", requires_grad=False)
     y = origin_mlp.forward(x)
