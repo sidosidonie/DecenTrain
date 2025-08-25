@@ -1,3 +1,4 @@
+import enum
 from torch.nn import Linear, Module, Parameter
 from torch.nn import functional as F, init
 import math
@@ -123,48 +124,9 @@ def copy_to_cpu(x_device: torch.Tensor, stream_copy):
     else:
         return x_device, None
 
-class LinearWithMM(Module):
-    __constants__ = ["in_features", "out_features"]
-    in_features: int
-    out_features: int
-    weight : Tensor
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        device=None,
-        dtype=None,
-    ) -> None:
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = Parameter(
-            torch.empty((in_features, out_features), **factory_kwargs)
-        )
-        if bias:
-            self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
-        else:
-            self.register_parameter("bias", None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, input: Tensor) -> Tensor:
-        return torch.mm(input, self.weight)
-
-    def extra_repr(self) -> str:
-        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
 
 class VerifyLinear:
-    def __init__(self, linear: LinearWithMM, st_cpu, st_gpu, noise=None):
+    def __init__(self, linear, st_cpu, st_gpu, noise=None):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.weight = linear.weight.clone().to("cpu")
@@ -238,6 +200,51 @@ class VerifyLinear:
 
         return grad_input_cpu, grad_weight_cpu
 
+
+class SparseLinearAlgo(enum.Enum):
+    MASK = 1
+    TORCH_SPARSE = 2
+    FA_SLIDING_WINDOW = 3
+
+class SparseLinear(Linear):
+
+    def __init__(self, in_features, out_features, bias=True, sparse_algo=SparseLinearAlgo.MASK, sparse_mask=None):
+        super().__init__(in_features, out_features, bias)
+        self.sparse_mask = sparse_mask
+        self.sparse_algo = sparse_algo
+        if sparse_algo == SparseLinearAlgo.MASK:
+            self.weight = self.weight * self.sparse_mask
+        elif sparse_algo == SparseLinearAlgo.TORCH_SPARSE:
+            self.weight = self.weight.to_sparse_bsc(blocksize=(16, 4), dense_dim=0)
+        elif sparse_algo == SparseLinearAlgo.FA_SLIDING_WINDOW:
+            assert False, "Not implemented FA"
+        else:
+            assert False, "Invalid sparse algo"
+
+    def forward(self, input):
+        if self.sparse_mask is not None:
+            weight = self.weight * self.sparse_mask
+        else:
+            weight = self.weight
+        return F.linear(input, weight, self.bias)
+
+
+def sliding_window_mask(seq_len, window, device="cpu"):
+    # indices [L, L]
+    arange = torch.arange(seq_len, device=device)
+    diff = arange[:, None] - arange[None, :] 
+    # allow positions 0..window (causal + window)
+    mask = torch.where((diff >= 0) & (diff <= window), 1.0, 0.0)
+    return mask
+
+def test_sparse_linear():
+    seqlen = 10
+    hidden = 5
+    window = 3
+    mask = sliding_window_mask(seqlen, window)
+    linear = SparseLinear(hidden, seqlen, sparse_mask=mask)
+    print(linear)
+
 def test_verify(batch, hidden, inter):
     linear = Linear(hidden, inter, bias=False).to("cuda")
     cuda_stream = torch.cuda.Stream()
@@ -257,4 +264,5 @@ def test_verify(batch, hidden, inter):
     pass
 
 if __name__ == "__main__":
-    test_verify(32, 64, 128)
+    test_sparse_linear()
+    #test_verify(32, 64, 128)

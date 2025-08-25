@@ -9,7 +9,11 @@ run() {
 }
 
 run 0 200
+run 1e-9 200
+run 1e-8 200
 run 1e-7 200
 run 1e-5 200
+run 1e-6 200
+run 1e-4 200
 
 
