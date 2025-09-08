@@ -44,7 +44,6 @@ dataset = load_dataset("json", data_files={split: f"{data_path}/{split}.jsonl"})
 if limit_samples:
     dataset = dataset.select(range(limit_samples))
 
-
 for context_len in [512]:
     total_loss = 0.0
     total_tokens = 0
@@ -56,7 +55,6 @@ for context_len in [512]:
 
     sample_i = 0
     for example in tqdm(dataset):
-        g_logger.info(f"Processing example {sample_i}")
         sample_i += 1
         text = example["text"]
         encodings = tokenizer(text, return_tensors="pt", truncation=False)

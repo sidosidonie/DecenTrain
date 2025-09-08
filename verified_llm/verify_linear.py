@@ -179,28 +179,6 @@ class VerifyLinear:
             self.verify_event.record(self.cpu_stream)
             return loss, output_cpu
 
-    def verify_backward(self, grad_output_gpu, grad_input_gpu, grad_weight_gpu):
-        """
-        Verify grad_input and grad_weight, and return them
-        grad_input = mm(grad_output, weight)
-        grad_weight = mm(grad_output, input)
-        """
-        input_cpu = self.ctx[0]
-        weight_cpu = self.weight
-
-        grad_output_cpu = copy_to_cpu(grad_output_gpu, self.cpu_stream)
-        grad_input_cpu = copy_to_cpu(grad_input_gpu, self.cpu_stream)
-        grad_weight_cpu = copy_to_cpu(grad_weight_gpu, self.cpu_stream)
-
-        self.cpu_stream.synchronize()
-        loss1 = freivalds_algorithm(grad_output_cpu, weight_cpu, grad_input_cpu)
-        loss2 = freivalds_algorithm(grad_output_cpu, input_cpu, grad_weight_cpu)
-        g_logger.info(f"backward loss1 {loss1}")
-        g_logger.info(f"backward loss2 {loss2}")
-
-        return grad_input_cpu, grad_weight_cpu
-
-
 class SparseLinearAlgo(enum.Enum):
     MASK = 1
     TORCH_SPARSE = 2

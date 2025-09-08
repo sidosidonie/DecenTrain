@@ -8,7 +8,7 @@ run() {
     python scripts/plot_losses.py logs/ppl-llama-noise-$noise_scale-limit-$limit_samples-loss.log --output logs/ppl-llama-noise-$noise_scale-limit-$limit_samples-loss
 }
 
-run 0 200
+run 0 20
 run 1e-9 200
 run 1e-8 200
 run 1e-7 200
