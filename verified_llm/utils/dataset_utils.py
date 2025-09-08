@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 import torch
 import os
 
-def get_c4_datasets(model_path, batch, max_length, split="train"):
+def get_c4_datasets(model_path, batch, max_length, split="test"):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -36,7 +36,7 @@ class C4Dataset(Dataset):
 
 def test_dataset():
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    dataloader = get_c4_datasets(model_name)
+    dataloader = get_c4_datasets(model_name, 1, 1024, "test")
     for inp, lab in dataloader:
         print(inp)
         print(lab)
