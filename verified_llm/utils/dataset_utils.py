@@ -11,7 +11,7 @@ def get_c4_datasets(model_path, batch, max_length, split="train"):
     def tokenize_function(examples):
         return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=max_length, return_tensors="pt")
 
-    c4_streamed = load_dataset(os.getenv("HOME") + "/data/c4", split=split)
+    c4_streamed = load_dataset("dataset/c4", split=split)
     column_names = c4_streamed.column_names
 
     tokenized_datasets = c4_streamed.map(tokenize_function, remove_columns=column_names, num_proc=32, load_from_cache_file=True, batched=True)
@@ -41,9 +41,6 @@ def test_dataset():
         print(inp)
         print(lab)
         exit(-1)
-
-def dd():
-    dataset = load_dataset("/home/ubuntu/data/c4", split="train")
 
 if __name__ == "__main__":
     test_dataset()
