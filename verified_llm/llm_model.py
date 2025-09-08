@@ -1,7 +1,7 @@
 """
   Build llm models with verified linear
 """
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, LlamaConfig
 from verified_llm.mlp_layer import LlamaMLPVerify, LlamaMLP
 from verified_llm.attn_layer import LlamaAttentionVerify , LlamaAttention
 from verified_llm.utils.log_utils import g_logger

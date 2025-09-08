@@ -12,7 +12,7 @@ import numpy as np
 import logging
 from pprint import pprint
 
-g_logger.setLevel(logging.INFO)
+g_logger.setLevel(logging.WARNING)
 
 def eval_metrics(model, tokenizer, dataloader, itern=1):
     ppl_metric = Perplexity(ignore_index=tokenizer.pad_token_id).to('cuda')
@@ -100,24 +100,27 @@ def eval(verify=False, batch = 2, seqlen = 2048):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     eval_metrics(model, tokenizer, data)
 
+def forward_main():
+    len = 1024*3
+    out, time_ori = forward(len, False, itern=3)
+    out, time_ver = forward(len, True, itern=3)
+
+    print(f"Origin: {time_ori}ms")
+    print(f"Verify: {time_ver}ms")
+
 def generate_main():
     prompts = [
     "Once upon a time, there was",
     "In a future world ruled by AI,",
     "The recipe for the perfect cake is" 
     ]
-    len = 1024*3
-    gen_text_ori, time_ori = generate(prompts, True, False)
+    gen_text_ori, time_ori = generate(prompts, False, False)
     print(f"Origin generation time: {time_ori} ms")
     for gen_text in gen_text_ori:
         print(f">>> Origin generated text: {gen_text}")
 
-    #gen_text_ver, time_ver = generate(prompt, True, False)
-    #print(f">>> Verify generated text: {gen_text_ver}, use time: {time_ver} ms")
-
-    #gen_text_ver, time_ver = forward(len, True)
-    #print(f"Verify: {time_ver}ms")
-    #print(f"Origin: {time_ori}ms")
+    gen_text_ver, time_ver = generate(prompts, True, False)
+    print(f">>> Verify generated text: {gen_text_ver}, use time: {time_ver} ms")
 
 if __name__ == "__main__":
-    generate_main()
+    forward_main()
