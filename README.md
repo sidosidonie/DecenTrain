@@ -7,7 +7,7 @@ Reimplemented LlamaMLP and LlamaAttention layers to support freivalds verificati
 
 ### Install
 
-In conda or virtual env, install dependencies.
+In conda or virtual env, install dependencies. Tested version: conda 25.5.1
 
 ```bash
 conda env create -f env.yml
