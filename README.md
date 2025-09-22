@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 ### Model
 
-We use llama
+Please checkout https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct
 
 ### Patch on transformers llama file
 To export LlamaAttention and LlamaMLP, we need a temporary patch on the modeling_llama.py file
