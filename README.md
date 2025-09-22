@@ -10,7 +10,32 @@ Reimplemented LlamaMLP and LlamaAttention layers to support freivalds verificati
 In conda or virtual env, install dependencies.
 
 ```bash
+conda env create -f env.yml
 pip install -r requirements.txt
+```
+
+### Model
+
+We use llama
+
+### Patch on transformers llama file
+To export LlamaAttention and LlamaMLP, we need a temporary patch on the modeling_llama.py file
+
+/PATH/TO/CONDA/envs/verify-llm/lib/python3.12/site-packages/transformers/models/llama/modeling_llama.py
+
+```python
+__all__ = [
+    "LlamaForCausalLM",
+    "LlamaModel",
+    "LlamaPreTrainedModel",
+    "LlamaForSequenceClassification",
+    "LlamaForQuestionAnswering",
+    "LlamaForTokenClassification",
+    ## export the following as well
+    "LlamaAttention",
+    "LlamaMLP",
+    "apply_rotary_pos_emb"
+]
 ```
 
 ### Dataset
