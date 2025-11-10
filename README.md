@@ -42,6 +42,12 @@ __all__ = [
 
 c4 test dataset, located in dataset/c4, this is called by verified_llm/utils/dataset_utils.py
 
+- Download large files
+
+```bash
+git lfs pull
+```
+
 ### Test noise  
 ```
 mkdir logs
@@ -66,3 +72,7 @@ python verified_llm/eval.py
 - utils/: helpers like dataset functions
 - legacy/: old code that is not useful
 
+
+## Async execution of LlamaMLP
+
+![alt text](assets/llamamlp.png)
