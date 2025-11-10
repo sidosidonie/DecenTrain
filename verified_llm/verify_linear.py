@@ -52,7 +52,7 @@ def freivalds_batch_matmul(A, B, C, k=10):
     return loss
 
 def freivalds_algorithm_2d(A, B, C, k=10):
-    g_logger.info(f"freivalds_algorithm_2d: {A.shape=}, {B.shape=}, {C.shape=}")
+    g_logger.debug(f"freivalds_algorithm_2d: {A.shape=}, {B.shape=}, {C.shape=}")
     assert A.device == B.device == C.device, "All tensors must be on the same device"
     n = C.shape[-1]
     r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
@@ -145,16 +145,17 @@ class VerifyLinear:
     def forward(self, input):
         with torch.cuda.stream(self.gpu_stream):
             out = F.linear(input, self.linear.weight, bias=None)
-            g_logger.info(f"input mean={input.mean()}, std={input.std()}")
-            g_logger.info(f"weight mean={self.linear.weight.mean()}, std={self.linear.weight.std()}")
-            g_logger.info(f"out mean={out.mean()}, std={out.std()}")
+            g_logger.debug(f"input mean={input.mean()}, std={input.std()}")
+            g_logger.debug(f"weight mean={self.linear.weight.mean()}, std={self.linear.weight.std()}")
+            g_logger.debug(f"out mean={out.mean()}, std={out.std()}")
             out = add_noise(out, self.noise)
             self.compute_event.record(self.gpu_stream)
             return out
 
     def add_bias(self, input):
         if self.linear.bias is not None:
-            return input + self.linear.bias
+            with torch.cuda.stream(self.gpu_stream):
+                return input + self.linear.bias
         else:
             return input
 
@@ -166,6 +167,14 @@ class VerifyLinear:
             return input
 
     def verify_forward(self, input_from_gpu, output_from_gpu):
+        assert not input_from_gpu.is_cuda
+        assert not output_from_gpu.is_cuda
+        with torch.cuda.stream(self.cpu_stream):
+            loss = freivalds_algorithm(input_from_gpu, self.weight_t, output_from_gpu)
+            self.verify_event.record(self.cpu_stream)
+            return loss, None 
+
+    def verify_forward_finegrain(self, input_from_gpu, output_from_gpu):
         self.compute_event.synchronize()
         with torch.cuda.stream(self.cpu_stream):
             input_cpu, e1 = copy_to_cpu(input_from_gpu, self.cpu_stream)
