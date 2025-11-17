@@ -60,7 +60,11 @@ def freivalds_algorithm_2d(A, B, C, k=10):
     ABr = torch.mm(A, Br)
     Cr = torch.mm(C, r)
     loss = F.mse_loss(ABr, Cr).item()
-    assert loss < threshold, f"Freivalds' algorithm failed with loss {loss}"
+    if loss > threshold:
+        g_logger.fatal(f"Freivalds' algorithm failed with loss {loss}")
+        print(ABr)
+        print(Cr)
+        exit(-1)
     return loss
 
 def freivalds_algorithm(A, B, C, k = 10):

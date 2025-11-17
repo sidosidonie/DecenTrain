@@ -76,3 +76,28 @@ python verified_llm/eval.py
 ## Async execution of LlamaMLP
 
 ![alt text](assets/llamamlp.png)
+
+Total operations:
+
+```
+gate_proj 
+gate_proj_bias
+up_proj
+up_proj_bias
+act_silu
+mul_gate_up
+down_proj
+down_proj_bias
+```
+
+Piplined execution with verify operations:  
+
+```
+gate_proj 
+===
+gate_proj_bias & up_proj || copy_gate && verify_gate && gate_proj_bias
+===
+up_proj_bias && act_silu && mul_gate_up && down_proj|| copy_up && verify_up &&up_proj_bias && act_silu && mul_gate
+===
+down_proj_bias || copy_down && verify_down && down_proj_bias
+```
