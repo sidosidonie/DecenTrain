@@ -216,62 +216,93 @@ class LlamaMLPVerify(torch.nn.Module):
 
         self.event_ed.record(self.stream_cpu)
         self.event_ed.synchronize()
-        self.event_st.synchronize()
         t = self.event_st.elapsed_time(self.event_ed)
         print("Sync Elapsed time: ", t)
         # return down, down_cpu, t
         return down_bias, t
 
-
     def forward_async(self, x_gpu):
         self.event_st.record()
-        # gate
+
+        # gate_proj 
         gate = self.gate_proj.forward(x_gpu)
         x_cpu, e_copy = copy_to_cpu(x_gpu, self.stream_cpu)
 
-        self.gate_proj.compute_event.synchronize()
-        gate_cpu, gate_cpu_e = copy_to_cpu(gate, self.stream_cpu)
+        ## ===============
 
-        e_copy.synchronize()
-        gate_cpu_e.synchronize()
-        gate_diff, _ = self.gate_proj.verify_forward(x_cpu, gate_cpu)
-        print("gate diff = ", gate_diff)
-
-        # up
+        # gate_proj_bias & up_proj || copy_gate && verify_gate && gate_proj_bias
+        ### GPU
         gate_bias = self.gate_proj.add_bias(gate)
         up = self.up_proj.forward(x_gpu)
+        ### CPU 
+        self.gate_proj.compute_event.synchronize()
+        gate_cpu, ee = copy_to_cpu(gate, self.stream_cpu)
+        ee.synchronize()
+        diff_gate = self.gate_proj.verify_forward(x_cpu, gate_cpu)
+        g_logger.info(f"gate diff = {diff_gate}")
+        gate_bias_cpu = self.gate_proj.add_bias_cpu(gate_cpu)
 
+
+        ## ===============
+
+
+        # up_proj_bias && act_silu && mul_gate_up && down_proj 
+        # || copy_up && verify_up &&up_proj_bias && act_silu && mul_gate
+        ### GPU
+        up_bias = self.up_proj.add_bias(up)
+        act_silu = self.act(gate_bias, self.stream_gpu)
+        mul_gate_up = self.mul(act_silu, up_bias, self.stream_gpu)
+        down = self.down_proj.forward(mul_gate_up)
+        ### CPU
         self.up_proj.compute_event.synchronize()
-        up_cpu, up_cpu_e = copy_to_cpu(up, self.stream_cpu)
-        gate_cpu_bias = self.gate_proj.add_bias_cpu(gate_cpu)
-
-        up_cpu_e.synchronize()
-        up_diff, _ = self.up_proj.verify_forward(x_cpu, up_cpu)
-        print("up diff = ", up_diff)
-
-        act = self.act(gate_bias, self.stream_gpu)
-
-        up_bias = self.up_proj.add_bias(up)        
-        up_mul_act = self.mul(act, up_bias, self.stream_gpu)
-
-        down = self.down_proj.forward(up_mul_act)
-        self.down_proj.compute_event.synchronize()
-        down_bias = self.down_proj.add_bias(down)
-
-        down_cpu, down_cpu_e = copy_to_cpu(down, self.stream_cpu)
-        act_cpu = self.act(gate_cpu_bias, self.stream_cpu)
+        up_cpu, ee = copy_to_cpu(up, self.stream_cpu)
+        ee.synchronize()
+        diff_up = self.up_proj.verify_forward(x_cpu, up_cpu)
+        g_logger.info(f"up diff = {diff_up}")
         up_bias_cpu = self.up_proj.add_bias_cpu(up_cpu)
-        up_mul_act_cpu = self.mul(act_cpu, up_bias_cpu, self.stream_cpu)
+        act_silu_cpu = self.act(gate_bias_cpu, self.stream_cpu)
+        mul_gate_up_cpu = self.mul(act_silu_cpu, up_bias_cpu, self.stream_cpu)
+        
+        
+        ## ===============
 
-        down_cpu_e.synchronize()
-        down_diff, _ = self.down_proj.verify_forward(up_mul_act_cpu, down_cpu)
-        print("down diff = ", down_diff)
+        # down_proj_bias || copy_down && verify_down && down_proj_bias
+        ### GPU
+        down_bias = self.down_proj.add_bias(down)
+        ### CPU
+        self.down_proj.compute_event.synchronize()
+        down_cpu, ee = copy_to_cpu(down, self.stream_cpu)
+        ee.synchronize()
+        diff_down = self.down_proj.verify_forward(mul_gate_up_cpu, down_cpu)
+        g_logger.info(f"down diff = {diff_down}")
+        down_bias_cpu = self.down_proj.add_bias_cpu(down_cpu)
+
+        self.stream_gpu.synchronize()
 
         self.event_ed.record()
         self.event_ed.synchronize()
         t = self.event_st.elapsed_time(self.event_ed)
-        print("Async Elapsed time: ", t)
+        g_logger.info(f"Async Elapsed time: {t}")
+
         return down_bias, t
+        
+
+    def forward_origin(self, x):
+        self.event_st.record()
+        gate = self.gate_proj.forward(x)
+        gate_bias = self.gate_proj.add_bias(gate)
+        act_silu = self.act(gate_bias, self.stream_gpu)
+        up = self.up_proj.forward(x)
+        up_bias = self.up_proj.add_bias(up)
+        mul = gate_bias + up_bias
+        down = self.down_proj.forward(mul)
+        down_bias = self.down_proj.add_bias(down)
+        self.event_ed.record()
+        self.event_ed.synchronize()
+        self.event_st.synchronize()
+        t = self.event_st.elapsed_time(self.event_ed)
+        return down_bias, t
+
 
 
 def test_mlp_async(batch):
@@ -300,16 +331,20 @@ def test_mlp_async(batch):
 
     async_time = 0
     sync_time = 0
+    origin_time = 0
     for i in range(13):
         y_v, ta = mlp.forward_async(x)
         y_v2, ts = mlp.forward_sync(x)
+        y_v3, to = mlp.forward_origin(x)
         assert torch.allclose(y_v2, y_v)
         if i >= 3:
             async_time += ta
             sync_time += ts
+            origin_time += to
     
     print("ASync time: ", async_time/10.)
     print("Sync time: ", sync_time/10.)
+    print("Origin time: ", origin_time/10.)
 
 if __name__ == "__main__":
     test_mlp_async(2048*4)
