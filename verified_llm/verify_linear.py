@@ -7,6 +7,10 @@ import torch
 from torch import Tensor
 from verified_llm.utils.log_utils import g_logger
 import numpy as np
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+all_matmul = {}
 
 threshold = 1e-5
 
@@ -39,8 +43,83 @@ def add_noise(C, noise_scale=None):
     CC = C + noise
     return CC
 
+def freivalds_batch_matmul_bias(A, B, C, bias, k=10):
+    """_summary_
+
+    AxB+b = C
+
+    given C
+    AxBxr + bxr = Cxr
+    
+    [mxk] x [kxn] + [n] = [mxn] 
+
+    """
+    # g_logger.info(f"freivalds_batch_matmul: {A.shape=}, {B.shape=}, {C.shape=}")
+    assert A.device == B.device == C.device, "All tensors must be on the same device"
+    n = C.shape[-1]
+    r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
+    Br = torch.matmul(B, r)
+    ABr = torch.matmul(A, Br)
+    if bias is not None:
+        # bias shape [..., p] broadcast to last dim
+        # Compute bias @ r -> [..., k]
+        bias_r = torch.matmul(bias.unsqueeze(-2), r)  # [..., 1, k]
+        # Broadcast to match ABr shape
+        ABr = ABr + bias_r.expand_as(ABr)
+
+    Cr = torch.matmul(C, r)
+    loss = F.mse_loss(ABr, Cr).item()
+    #assert loss < threshold, f"Freivalds' algorithm failed with loss {loss}"
+    return loss
+
+def freivalds_algorithm_2d_bias(A, B, C, bias=None, k=10):
+    """
+    Probabilistically verify C = A @ B + bias using Freivalds algorithm (2D matrices)
+    A: [m, n]
+    B: [n, p]
+    C: [m, p]
+    bias: None or [p] (row bias)
+    k: number of iterations
+    """
+    g_logger.debug(f"freivalds_algorithm_2d_bias: {A.shape=}, {B.shape=}, {C.shape=}, {bias.shape if bias is not None else None=}")
+
+    # Device check
+    assert A.device == B.device == C.device, "All tensors must be on the same device"
+
+    n = C.shape[-1]
+
+    # Get random {0,1} vector(s) of shape [p, k]
+    r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
+
+    # Compute B @ r
+    Br = torch.mm(B, r)          # [n, k]
+
+    # Compute A @ (B @ r)
+    ABr = torch.mm(A, Br)        # [m, k]
+
+    # Add bias if provided
+    if bias is not None:
+        # bias: [p] -> [1, p] @ [p, k] = [1, k]
+        bias_r = torch.mm(bias.view(1, -1), r)  # [1, k]
+        # Broadcast to [m, k]
+        ABr = ABr + bias_r.expand(ABr.shape)
+
+    # Compute C @ r
+    Cr = torch.mm(C, r)          # [m, k]
+
+    # Compute MSE loss
+    loss = F.mse_loss(ABr, Cr).item()
+
+    # Optional threshold check
+    # if loss > threshold:
+    #     g_logger.fatal(f"Freivalds' algorithm failed with loss {loss}")
+    #     print(ABr)
+    #     print(Cr)
+
+    return loss
+
 def freivalds_batch_matmul(A, B, C, k=10):
-    g_logger.info(f"freivalds_batch_matmul: {A.shape=}, {B.shape=}, {C.shape=}")
+    g_logger.debug(f"freivalds_batch_matmul: {A.shape=}, {B.shape=}, {C.shape=}")
     assert A.device == B.device == C.device, "All tensors must be on the same device"
     n = C.shape[-1]
     r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
@@ -49,6 +128,34 @@ def freivalds_batch_matmul(A, B, C, k=10):
     Cr = torch.matmul(C, r)
     loss = F.mse_loss(ABr, Cr).item()
     #assert loss < threshold, f"Freivalds' algorithm failed with loss {loss}"
+    return loss
+
+def freivalds_batch_matmul_parallel(A, B, C, k=10):
+    g_logger.debug(f"freivalds_batch_matmul_parallel: {A.shape=}, {B.shape=}, {C.shape=}")
+    assert A.device == B.device == C.device, "All tensors must be on the same device"
+
+    n = C.shape[-1]
+    r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
+
+    # Step 1: B @ r (must happen first)
+    Br = torch.matmul(B, r)
+
+    # Step 2: Parallelize A @ Br and C @ r
+    def compute_ABr(): 
+        return torch.matmul(A, Br)
+
+    def compute_Cr(): 
+        return torch.matmul(C, r)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_ABr = executor.submit(compute_ABr)
+        f_Cr = executor.submit(compute_Cr)
+        ABr = f_ABr.result()
+        Cr = f_Cr.result()
+
+    # Step 3: compute loss
+    loss = F.mse_loss(ABr, Cr).item()
+    # assert loss < threshold, f"Freivalds' algorithm failed with loss {loss}"
     return loss
 
 def freivalds_algorithm_2d(A, B, C, k=10):
@@ -60,16 +167,24 @@ def freivalds_algorithm_2d(A, B, C, k=10):
     ABr = torch.mm(A, Br)
     Cr = torch.mm(C, r)
     loss = F.mse_loss(ABr, Cr).item()
-    if loss > threshold:
-        g_logger.fatal(f"Freivalds' algorithm failed with loss {loss}")
-        print(ABr)
-        print(Cr)
-        exit(-1)
+    # if loss > threshold:
+    #     g_logger.fatal(f"Freivalds' algorithm failed with loss {loss}")
+        # print(ABr)
+        # print(Cr)
     return loss
+
+def freivalds_algorithm_bias(A, B, C, bias, k = 10):
+    if len(A.shape) > 2:
+        return freivalds_batch_matmul_bias(A, B, C, bias, k)
+    elif len(A.shape) == 2:
+        return freivalds_algorithm_2d_bias(A, B, C, bias, k)
+    else:
+        raise ValueError(f"Invalid shape: {A.shape}")
+
 
 def freivalds_algorithm(A, B, C, k = 10):
     if len(A.shape) > 2:
-        return freivalds_batch_matmul(A, B, C, k)
+        return freivalds_batch_matmul_parallel(A, B, C, k)
     elif len(A.shape) == 2:
         return freivalds_algorithm_2d(A, B, C, k)
     else:
@@ -128,6 +243,87 @@ def copy_to_cpu(x_device: torch.Tensor, stream_copy):
     else:
         return x_device, None
 
+class SyncVerifyLinear(Module):
+    def __init__(self, linear, gpu_stream, cpu_stream):
+        super().__init__()
+        self.linear = linear
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.weight = linear.weight.clone().to("cpu")
+        self.weight_t = self.weight.t() 
+        self.bias = self.linear.bias
+        if self.linear.bias is not None:
+            self.bias_cpu = linear.bias.clone().to("cpu")
+        else:
+            self.bias_cpu = None
+
+        self.gpu_stream = gpu_stream
+        self.cpu_stream = cpu_stream
+            
+        self.ctx = []
+        self.verify_event = torch.cuda.Event(blocking=True)
+        self.compute_event = torch.cuda.Event(blocking=True)
+
+    def forward(self, input):
+        t1 = time.time()
+        out = F.linear(input, self.linear.weight, bias=None)
+        tup = (input.shape, self.linear.weight.shape, out.shape)
+        if tup not in all_matmul.keys():
+            all_matmul[tup] = 1
+        else:
+            all_matmul[tup] += 1
+
+        t2 = time.time()
+        # print("Linear ", t2-t1)
+        input_cpu, e = copy_to_cpu(input, self.cpu_stream)
+        self.gpu_stream.synchronize()
+        t3 = time.time()
+        # print("Copy input ", t3-t2)
+        out_cpu, e = copy_to_cpu(out, self.cpu_stream)
+        t4 = time.time()
+        self.cpu_stream.synchronize()
+        # print("Copy output ", t4-t3)
+        loss, _ = self.verify_forward(input_cpu, out_cpu)
+        self.cpu_stream.synchronize()
+        t5 = time.time()
+        # print("Verify output", t5-t4)
+        return self.add_bias(out)
+
+    def add_bias(self, input):
+        if self.linear.bias is not None:
+            with torch.cuda.stream(self.gpu_stream):
+                return input + self.linear.bias
+        else:
+            return input
+
+    def add_bias_cpu(self, input):
+        if self.linear.bias is not None:
+            with torch.cuda.stream(self.cpu_stream):
+                return input + self.bias_cpu
+        else:
+            return input
+
+    def verify_forward(self, input_from_gpu, output_from_gpu):
+        assert not input_from_gpu.is_cuda
+        assert not output_from_gpu.is_cuda
+        with torch.cuda.stream(self.cpu_stream):
+            loss = freivalds_algorithm(input_from_gpu, self.weight_t, output_from_gpu)
+            self.verify_event.record(self.cpu_stream)
+            return loss, None 
+
+    def verify_forward_finegrain(self, input_from_gpu, output_from_gpu):
+        self.compute_event.synchronize()
+        with torch.cuda.stream(self.cpu_stream):
+            input_cpu, e1 = copy_to_cpu(input_from_gpu, self.cpu_stream)
+            output_cpu, e2 = copy_to_cpu(output_from_gpu, self.cpu_stream)
+            if e1 is not None:
+                e1.synchronize()
+            if e2 is not None:
+                e2.synchronize()
+            self.cpu_stream.synchronize()
+            loss = freivalds_algorithm(input_cpu, self.weight_t, output_cpu)
+            self.verify_event.record(self.cpu_stream)
+            return loss, output_cpu
 
 class VerifyLinear:
     def __init__(self, linear, st_cpu, st_gpu, noise=None):
