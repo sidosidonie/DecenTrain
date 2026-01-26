@@ -6,3 +6,5 @@ accelerate
 torchmetrics
 fire
 matplotlib
+diffusers
+safetensors
