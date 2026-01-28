@@ -5,11 +5,14 @@ import torch.nn.functional as F
 from diffusers.models.normalization import AdaLayerNormZero
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import FluxAttnProcessor2_0, Attention
-from verified_llm.verify_linear import SyncVerifyLinear
-from diffusers import FluxPipeline
+from diffusers.utils import load_image
+from verified_llm.verify_linear import SyncVerifyLinear, all_matmul
+from diffusers import FluxPipeline, DiffusionPipeline, Flux2Pipeline
+from pprint import pprint
 
 
-
+torch.set_num_threads(8)
+torch.set_num_interop_threads(2)
 
 class FluxTransformerBlock(nn.Module):
     r"""
@@ -162,26 +165,109 @@ def replace_linear(module: nn.Module):
             replace_linear(child)
 
 def test_sync_verify():
-    l1 = nn.Linear(10, 20)
+    import time
+    l1 = nn.Linear(3072, 4096).to("cuda")
 
     sl1 = SyncVerifyLinear(l1, torch.cuda.default_stream(), torch.cuda.Stream())
 
-    inp = torch.randn(128, 10)
-    l1_out = l1(inp)
-    sl1_out = sl1.forward(inp)
+    inp = torch.randn(3072, 3072).to("cuda")
+
+    t1 = time.time()
+    for i in range(20):
+        l1_out = l1(inp)
+    t2 = time.time()
+    dur1 = (t2 - t1) / 20
+    print("Linear time ", dur1)
+
+    t1 = time.time()
+    for i in range(20):
+        sl1_out = sl1(inp)
+    t2 = time.time()
+    dur1 = (t2 - t1) / 20
+    print("Verify Linear time ", dur1)
     
-    print(l1_out)
-    print(sl1_out)
 
-    print(torch.equal(l1_out, sl1_out))
+def replace_linear_for_pipeline(pipe : FluxPipeline):
+    replace_linear(pipe.transformer)
+    replace_linear(pipe.vae)
+    print(pipe.vae)
+
+def flux1():
+    model_name = "black-forest-labs/FLUX.1-schnell"
+    pipe = Flux2Pipeline.from_pretrained(
+        model_name,
+        dtype=torch.bfloat16,
+    ).to("cuda")
+    
+
+    prompt = "A cat holding a bottle, saying hello!"
+
+    starter = torch.cuda.Event(enable_timing=True)
+    ender = torch.cuda.Event(enable_timing=True)
+
+    with torch.inference_mode():
+        replace_linear_for_pipeline(pipe)
+        print(pipe)
+
+        torch.cuda.synchronize()
+        starter.record()
+
+        image = pipe(
+            prompt,
+            guidance_scale=3.5,
+            num_inference_steps=5
+        ).images[0]
+
+        ender.record()
+        torch.cuda.synchronize()
+
+        elapsed_ms = starter.elapsed_time(ender)
+        print(f"Inference time: {elapsed_ms:.2f} ms")
+
+        image.save("flux.png")
 
 
+    pprint(all_matmul)
 
-if __name__ == "__main__":
-    pipe = FluxPipeline.from_pretrained(
-    "black-forest-labs/FLUX.1-dev", 
-    torch_dtype=torch.float16).to("cuda")
-    print(pipe)
+def flux2():
+    model_name = "black-forest-labs/FLUX.2-klein-base-9B"
+    pipe = Flux2Pipeline.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=False,
+    ).to("cuda")
+    
+
+    prompt = "Turn this cat into a dog"
+    input_image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png")
+
+
+    starter = torch.cuda.Event(enable_timing=True)
+    ender = torch.cuda.Event(enable_timing=True)
+
+    with torch.inference_mode():
+        # replace_linear_for_pipeline(pipe)
+        print(pipe)
+
+        torch.cuda.synchronize()
+        starter.record()
+
+        print(input_image)
+        print(type(prompt))
+        
+        image = pipe(image=input_image, prompt=prompt).images[0]
+
+        ender.record()
+        torch.cuda.synchronize()
+
+        elapsed_ms = starter.elapsed_time(ender)
+        print(f"Inference time: {elapsed_ms:.2f} ms")
+
+        image.save("flux.png")
+
+
+    pprint(all_matmul)
+
     # block = FluxTransformerBlock(
     #     dim=3072,
     #     num_attention_heads=24,
@@ -194,3 +280,5 @@ if __name__ == "__main__":
     # replace_linear(block)
     
 
+
+flux2()
