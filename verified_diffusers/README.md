@@ -31,7 +31,56 @@ Linear shapes: [input, weight, output] : num of calls
  (torch.Size([1, 16384, 512]), torch.Size([512, 512]), torch.Size([1, 16384, 512])): 4}
  ```
 
+## Z-image
 
+- Short prompt
+ - Origin time for 1 step: 6958.60 ms
+ - Verified time for 1 step: 15948.18 ms
+
+ - Matmul shapes
+```
+Inference time: 15948.18 ms
+{(torch.Size([1, 16384, 512]), torch.Size([512, 512]), torch.Size([1, 16384, 512])): 4,
+ (torch.Size([2, 32, 3840]), torch.Size([3840, 3840]), torch.Size([2, 32, 3840])): 8,
+ (torch.Size([2, 32, 3840]), torch.Size([10240, 3840]), torch.Size([2, 32, 10240])): 4,
+ (torch.Size([2, 32, 10240]), torch.Size([3840, 10240]), torch.Size([2, 32, 3840])): 2,
+ (torch.Size([2, 256]), torch.Size([1024, 256]), torch.Size([2, 1024])): 1,
+ (torch.Size([2, 256]), torch.Size([3840, 256]), torch.Size([2, 3840])): 1,
+ (torch.Size([2, 256]), torch.Size([15360, 256]), torch.Size([2, 15360])): 32,
+ (torch.Size([2, 1024]), torch.Size([256, 1024]), torch.Size([2, 256])): 1,
+ (torch.Size([2, 4096, 3840]), torch.Size([3840, 3840]), torch.Size([2, 4096, 3840])): 8,
+ (torch.Size([2, 4096, 3840]), torch.Size([10240, 3840]), torch.Size([2, 4096, 10240])): 4,
+ (torch.Size([2, 4096, 10240]), torch.Size([3840, 10240]), torch.Size([2, 4096, 3840])): 2,
+ (torch.Size([2, 4128, 3840]), torch.Size([64, 3840]), torch.Size([2, 4128, 64])): 1,
+ (torch.Size([2, 4128, 3840]), torch.Size([3840, 3840]), torch.Size([2, 4128, 3840])): 120,
+ (torch.Size([2, 4128, 3840]), torch.Size([10240, 3840]), torch.Size([2, 4128, 10240])): 60,
+ (torch.Size([2, 4128, 10240]), torch.Size([3840, 10240]), torch.Size([2, 4128, 3840])): 30,
+ (torch.Size([64, 2560]), torch.Size([3840, 2560]), torch.Size([64, 3840])): 1,
+ (torch.Size([8192, 64]), torch.Size([3840, 64]), torch.Size([8192, 3840])): 1}
+```
+- Longer prompt
+ - Origin time for 1 step: 7059.03 ms 
+ - Verified time for 1 step: 16114.97 ms
+ - linear sizes for input, weight and output and the number of calls.
+```
+{(torch.Size([1, 16384, 512]), torch.Size([512, 512]), torch.Size([1, 16384, 512])): 4,
+ (torch.Size([2, 96, 3840]), torch.Size([3840, 3840]), torch.Size([2, 96, 3840])): 8,
+ (torch.Size([2, 96, 3840]), torch.Size([10240, 3840]), torch.Size([2, 96, 10240])): 4,
+ (torch.Size([2, 96, 10240]), torch.Size([3840, 10240]), torch.Size([2, 96, 3840])): 2,
+ (torch.Size([2, 256]), torch.Size([1024, 256]), torch.Size([2, 1024])): 1,
+ (torch.Size([2, 256]), torch.Size([3840, 256]), torch.Size([2, 3840])): 1,
+ (torch.Size([2, 256]), torch.Size([15360, 256]), torch.Size([2, 15360])): 32,
+ (torch.Size([2, 1024]), torch.Size([256, 1024]), torch.Size([2, 256])): 1,
+ (torch.Size([2, 4096, 3840]), torch.Size([3840, 3840]), torch.Size([2, 4096, 3840])): 8,
+ (torch.Size([2, 4096, 3840]), torch.Size([10240, 3840]), torch.Size([2, 4096, 10240])): 4,
+ (torch.Size([2, 4096, 10240]), torch.Size([3840, 10240]), torch.Size([2, 4096, 3840])): 2,
+ (torch.Size([2, 4192, 3840]), torch.Size([64, 3840]), torch.Size([2, 4192, 64])): 1,
+ (torch.Size([2, 4192, 3840]), torch.Size([3840, 3840]), torch.Size([2, 4192, 3840])): 120,
+ (torch.Size([2, 4192, 3840]), torch.Size([10240, 3840]), torch.Size([2, 4192, 10240])): 60,
+ (torch.Size([2, 4192, 10240]), torch.Size([3840, 10240]), torch.Size([2, 4192, 3840])): 30,
+ (torch.Size([128, 2560]), torch.Size([3840, 2560]), torch.Size([128, 3840])): 1,
+ (torch.Size([8192, 64]), torch.Size([3840, 64]), torch.Size([8192, 3840])): 1}
+```
  ## Product
 
  - Should we use quantized version? stable-diffusion.cpp?
