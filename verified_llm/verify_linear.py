@@ -243,6 +243,7 @@ def copy_to_cpu(x_device: torch.Tensor, stream_copy):
     else:
         return x_device, None
 
+
 class SyncVerifyLinear(Module):
     def __init__(self, linear, gpu_stream, cpu_stream):
         super().__init__()
@@ -388,6 +389,24 @@ class VerifyLinear:
             self.verify_event.record(self.cpu_stream)
             return loss, output_cpu
 
+
+def replace_linear(module: Module, gpu_stream, cpu_stream):
+    for name, child in module.named_children():
+        if isinstance(child, Linear):
+            new_layer = SyncVerifyLinear(
+                child, gpu_stream, cpu_stream
+            )
+
+            # Copy weights
+            new_layer.weight.data.copy_(child.weight.data)
+            if child.bias is not None:
+                new_layer.bias.data.copy_(child.bias.data)
+
+            setattr(module, name, new_layer)
+
+        else:
+            replace_linear(child, gpu_stream, cpu_stream)
+
 class SparseLinearAlgo(enum.Enum):
     MASK = 1
     TORCH_SPARSE = 2
@@ -449,6 +468,26 @@ def test_verify(batch, hidden, inter):
 
     print(f"Loss: {loss}")
     pass
+
+def test_sync_verify():
+    import time
+    l1 = nn.Linear(3072, 4096).to("cuda")
+    sl1 = SyncVerifyLinear(l1, torch.cuda.default_stream(), torch.cuda.Stream())
+    inp = torch.randn(3072, 3072).to("cuda")
+
+    t1 = time.time()
+    for i in range(20):
+        l1_out = l1(inp)
+    t2 = time.time()
+    dur1 = (t2 - t1) / 20
+    print("Linear time ", dur1)
+
+    t1 = time.time()
+    for i in range(20):
+        sl1_out = sl1(inp)
+    t2 = time.time()
+    dur1 = (t2 - t1) / 20
+    print("Verify Linear time ", dur1)
 
 if __name__ == "__main__":
     test_sparse_linear()
