@@ -1,3 +1,12 @@
+"""
+Verified attention layer — replaces any Llama/Qwen/Mistral-compatible attention
+module with manual attention + Freivalds verification via VerifyRuntime.
+
+Supports models with:
+  - q_proj, k_proj, v_proj, o_proj (Linear)
+  - Optional q_norm, k_norm (e.g. Qwen3 QK normalization)
+  - config with num_attention_heads, num_key_value_heads, head_dim
+"""
 from __future__ import annotations
 
 from typing import Optional, Tuple
@@ -6,9 +15,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import Cache
-from transformers.models.llama.modeling_llama import (
-    LlamaAttention,
-    apply_rotary_pos_emb,
+
+# Import apply_rotary_pos_emb from whichever model defines it.
+# Qwen3.5 version is preferred: it handles partial_rotary_factor (splits
+# q/k into rotary + passthrough parts), which is a superset of the Llama
+# version that assumes full-dim rotary.
+apply_rotary_pos_emb = None
+for _model_module in [
+    "transformers.models.qwen3_5.modeling_qwen3_5",
+    "transformers.models.qwen3.modeling_qwen3",
+    "transformers.models.llama.modeling_llama",
+    "transformers.models.qwen2.modeling_qwen2",
+    "transformers.models.mistral.modeling_mistral",
+]:
+    if apply_rotary_pos_emb is not None:
+        break
+    try:
+        import importlib
+        _mod = importlib.import_module(_model_module)
+        apply_rotary_pos_emb = getattr(_mod, "apply_rotary_pos_emb", None)
+    except ImportError:
+        pass
+
+assert apply_rotary_pos_emb is not None, (
+    "Could not import apply_rotary_pos_emb from any supported model module"
 )
 
 from verified_diffusers.zimage.layers import VerifyMatmul
@@ -25,16 +55,22 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class LlamaAttentionVerify(nn.Module):
+    """Verified attention module compatible with Llama, Qwen2, Qwen3, Mistral, etc.
+
+    Uses duck-typing: any module with q/k/v/o_proj Linear layers works.
+    Optionally handles q_norm / k_norm (Qwen3-style QK normalization).
+    """
+
     def __init__(
         self,
-        llama: LlamaAttention,
+        origin: nn.Module,
         runtime: VerifyRuntime,
         tag_prefix: str = "",
         noise=None,
     ):
         super().__init__()
-        self.config = llama.config
-        self.layer_idx = llama.layer_idx
+        self.config = origin.config
+        self.layer_idx = origin.layer_idx
         self.head_dim = getattr(
             self.config, "head_dim",
             self.config.hidden_size // self.config.num_attention_heads,
@@ -46,11 +82,20 @@ class LlamaAttentionVerify(nn.Module):
         self.attention_dropout = self.config.attention_dropout
         self.is_causal = True
 
+        # QK normalization (Qwen3 style) — copy if present
+        self.q_norm = getattr(origin, "q_norm", None)
+        self.k_norm = getattr(origin, "k_norm", None)
+
+        # Qwen3.5-style attn output gating: q_proj outputs 2x (query + gate),
+        # and attn_output *= sigmoid(gate) before o_proj.
+        expected_q_size = self.config.num_attention_heads * self.head_dim
+        self.has_attn_gate = (origin.q_proj.out_features == expected_q_size * 2)
+
         prefix = tag_prefix or f"layer{self.layer_idx}"
-        self.q_proj = VerifyLinear(llama.q_proj, runtime, f"{prefix}.q", noise)
-        self.k_proj = VerifyLinear(llama.k_proj, runtime, f"{prefix}.k", noise)
-        self.v_proj = VerifyLinear(llama.v_proj, runtime, f"{prefix}.v", noise)
-        self.o_proj = VerifyLinear(llama.o_proj, runtime, f"{prefix}.o", noise)
+        self.q_proj = VerifyLinear(origin.q_proj, runtime, f"{prefix}.q", noise)
+        self.k_proj = VerifyLinear(origin.k_proj, runtime, f"{prefix}.k", noise)
+        self.v_proj = VerifyLinear(origin.v_proj, runtime, f"{prefix}.v", noise)
+        self.o_proj = VerifyLinear(origin.o_proj, runtime, f"{prefix}.o", noise)
         self.qk_mm = VerifyMatmul(runtime, f"{prefix}.qk")
         self.kv_mm = VerifyMatmul(runtime, f"{prefix}.kv")
         self.runtime = runtime
@@ -61,18 +106,32 @@ class LlamaAttentionVerify(nn.Module):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Support both Llama-style (past_key_value) and Qwen3.5-style (past_key_values)
+        cache = past_key_value if past_key_value is not None else past_key_values
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         cos, sin = position_embeddings
 
         # Projections — async verified via VerifyRuntime
-        query = self.q_proj.forward(hidden_states)
-        query = self.q_proj.add_bias(query)
-        query = query.view(hidden_shape).transpose(1, 2)
+        q_out = self.q_proj.forward(hidden_states)
+        q_out = self.q_proj.add_bias(q_out)
+
+        if self.has_attn_gate:
+            # Qwen3.5: q_proj outputs [B, S, num_heads * head_dim * 2]
+            # Split into query states and output gate.
+            q_out = q_out.view(*input_shape, -1, self.head_dim * 2)
+            query, attn_gate = torch.chunk(q_out, 2, dim=-1)
+            attn_gate = attn_gate.reshape(*input_shape, -1)
+            query = query.view(hidden_shape).transpose(1, 2)
+        else:
+            attn_gate = None
+            query = q_out.view(hidden_shape).transpose(1, 2)
 
         key = self.k_proj.forward(hidden_states)
         key = self.k_proj.add_bias(key)
@@ -82,13 +141,22 @@ class LlamaAttentionVerify(nn.Module):
         value = self.v_proj.add_bias(value)
         value = value.view(hidden_shape).transpose(1, 2)
 
+        # QK normalization (Qwen3) — applied before rotary embeddings
+        if self.q_norm is not None:
+            query = self.q_norm(query)
+        if self.k_norm is not None:
+            key = self.k_norm(key)
+
         # Rotary embeddings
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # KV cache
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key, value = past_key_value.update(key, value, self.layer_idx, cache_kwargs)
+        # KV cache — Llama passes cache_kwargs, Qwen3.5 does not
+        if cache is not None:
+            try:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key, value = cache.update(key, value, self.layer_idx, cache_kwargs)
+            except TypeError:
+                key, value = cache.update(key, value, self.layer_idx)
 
         key = repeat_kv(key, self.num_key_value_groups)
         value = repeat_kv(value, self.num_key_value_groups)
@@ -113,6 +181,10 @@ class LlamaAttentionVerify(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1)
+
+        # Qwen3.5 gated attention: attn_output *= sigmoid(gate)
+        if attn_gate is not None:
+            attn_output = attn_output * torch.sigmoid(attn_gate)
 
         output = self.o_proj.forward(attn_output)
         output = self.o_proj.add_bias(output)
