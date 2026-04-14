@@ -1,6 +1,11 @@
-from verified_llm.mlp_layer import *
-from verified_llm.verify_linear import *
+import torch
+from torch.nn import Linear
 from pytest import mark
+
+from verified_diffusers.zimage.config import VerifyConfig
+from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_llm.verify_linear import VerifyLinear, copy_to_cpu, freivalds_batch_matmul
+
 
 @mark.parametrize("batch, hidden, inter, bias", [
     (32, 64, 128, False),
@@ -11,49 +16,54 @@ from pytest import mark
     (128, 256, 512, True),
 ])
 def test_linear(batch, hidden, inter, bias):
-    cpu_stream = torch.cuda.Stream()
-    gpu_stream = torch.cuda.Stream()
+    config = VerifyConfig(enabled=True, fail_on_error=True, profile_enabled=False)
+    runtime = VerifyRuntime(config)
+
     origin_linear = Linear(hidden, inter, bias=bias).to("cuda")
-    verify_linear = VerifyLinear(origin_linear, cpu_stream, gpu_stream)
+    verify_linear = VerifyLinear(origin_linear, runtime, "test")
 
     x = torch.randn(batch, hidden, device="cuda", requires_grad=False)
 
-    y = origin_linear(x)
+    y_origin = origin_linear(x)
     y_v = verify_linear.forward(x)
     y_v_bias = verify_linear.add_bias(y_v)
-    assert torch.allclose(y, y_v_bias)
+    assert torch.allclose(y_origin, y_v_bias)
 
-    loss, y_cpu = verify_linear.verify_forward(x, y_v)
-
-    y_cpu_bias = verify_linear.add_bias_cpu(y_cpu)
-    assert torch.allclose(y.to("cpu"), y_cpu_bias)
-    
-    assert loss < 1e-5, f"Verification failed with loss {loss}"
+    runtime.flush()
+    runtime.shutdown()
 
 
 @mark.parametrize("batch, noise_scale", [
-    (1, 1e-9 ),
+    (1, 1e-9),
     (2, 1e-9),
     (4, 1e-9),
     (8, 1e-9),
 ])
 def test_mlp(batch, noise_scale):
-    cpu_stream = torch.cuda.Stream()
-    gpu_stream = torch.cuda.Stream()
-    config = LlamaConfig("meta-llama/Llama-3.2-1B-Instruct")
-    origin_mlp = LlamaMLP(config).to("cuda")
-    verify_mlp = LlamaMLPVerify(origin_mlp, cpu_stream, gpu_stream, noise_scale)
+    from transformers.models.llama.modeling_llama import LlamaMLP
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from verified_llm.mlp_layer import LlamaMLPVerify
 
-    x = torch.randn(batch, config.hidden_size, device="cuda", requires_grad=False)
+    config = VerifyConfig(enabled=True, fail_on_error=True, profile_enabled=False)
+    runtime = VerifyRuntime(config)
+
+    llama_config = LlamaConfig("meta-llama/Llama-3.2-1B-Instruct")
+    origin_mlp = LlamaMLP(llama_config).to("cuda")
+    verify_mlp = LlamaMLPVerify(origin_mlp, runtime, noise_scale=noise_scale)
+
+    x = torch.randn(batch, llama_config.hidden_size, device="cuda", requires_grad=False)
     y = origin_mlp.forward(x)
     y_v = verify_mlp.forward(x)
     assert torch.allclose(y, y_v)
+
+    runtime.flush()
+    runtime.shutdown()
 
 
 @mark.parametrize("batch, seq_len, head_num, head_size", [
     (1, 128, 8, 64),
     (2, 64, 4, 32),
-    (4, 32, 2, 64), 
+    (4, 32, 2, 64),
     (8, 16, 1, 128),
     (3, 32, 1, 64),
 ])
@@ -72,6 +82,3 @@ def test_freivalds_qk(batch, seq_len, head_num, head_size):
 
     loss = freivalds_batch_matmul(q_cpu, k_cpu, qk_cpu)
     assert loss < 1e-8, f"Freivalds verification failed with loss {loss}"
-
-    
-    

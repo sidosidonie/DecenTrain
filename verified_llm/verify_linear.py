@@ -190,47 +190,6 @@ def freivalds_algorithm(A, B, C, k = 10):
     else:
         raise ValueError(f"Invalid shape: {A.shape}")
 
-def freivalds_algorithm_stream(A, B, C, stream, e1=None, e2=None, e3=None, k=10):
-    with torch.cuda.stream(stream):
-        n = C.shape[-1]
-        r = glob_random_vec.get_or_create_vec(n, k, A.dtype)
-        # r = torch.randn((n, k), dtype=torch.float16, device=A.device)
-        if len(A.shape) > 2:
-            # change A from (n, n, k) to (n*n, k)
-            # A = A.reshape(-1, A.shape[-1])
-            # B = B.reshape(-1, B.shape[-1])
-            # C = C.reshape(-1, C.shape[-1])
-            if e2 is not None:
-                e2.synchronize()
-            Br = torch.matmul(B, r)
-
-            if e1 is not None:
-                e1.synchronize()
-            ABr = torch.matmul(A, Br)
-
-            if e3 is not None:
-                e3.synchronize()
-            Cr = torch.matmul(C, r)
-        else:
-            if e2 is not None:
-                e2.synchronize()
-            Br = torch.mm(B, r)
-
-            if e1 is not None:
-                e1.synchronize()
-            ABr = torch.mm(A, Br)
-
-            if e3 is not None:
-                e3.synchronize()
-
-            Cr = torch.mm(C, r)
-
-        loss = F.mse_loss(ABr, Cr).item()
-        assert loss < threshold, f"Freivalds' algorithm failed with loss {loss}"
-        return loss
-    # if not torch.allclose(ABr, Cr):
-    #    ret = F.mse_loss(ABr, Cr).item()
-    # return ret
 
 def copy_to_cpu(x_device: torch.Tensor, stream_copy):
     if x_device.is_cuda:
@@ -326,86 +285,63 @@ class SyncVerifyLinear(Module):
             self.verify_event.record(self.cpu_stream)
             return loss, output_cpu
 
-class VerifyLinear:
-    def __init__(self, linear, st_cpu, st_gpu, noise=None):
-        self.in_features = linear.in_features
-        self.out_features = linear.out_features
-        self.weight = linear.weight.clone().to("cpu")
-        self.weight_t = self.weight.t() 
-        self.linear = linear
-        if self.linear.bias is not None:
-            self.bias_cpu = linear.bias.clone().to("cpu")
-            
-        self.ctx = []
-        self.cpu_stream = st_cpu
-        self.gpu_stream = st_gpu 
-        self.verify_event = torch.cuda.Event(blocking=True)
-        self.compute_event = torch.cuda.Event(blocking=True)
-        self.noise = noise
-
-    def forward(self, input):
-        with torch.cuda.stream(self.gpu_stream):
-            out = F.linear(input, self.linear.weight, bias=None)
-            g_logger.debug(f"input mean={input.mean()}, std={input.std()}")
-            g_logger.debug(f"weight mean={self.linear.weight.mean()}, std={self.linear.weight.std()}")
-            g_logger.debug(f"out mean={out.mean()}, std={out.std()}")
-            out = add_noise(out, self.noise)
-            self.compute_event.record(self.gpu_stream)
-            return out
-
-    def add_bias(self, input):
-        if self.linear.bias is not None:
-            with torch.cuda.stream(self.gpu_stream):
-                return input + self.linear.bias
-        else:
-            return input
-
-    def add_bias_cpu(self, input):
-        if self.linear.bias is not None:
-            with torch.cuda.stream(self.cpu_stream):
-                return input + self.bias_cpu
-        else:
-            return input
-
-    def verify_forward(self, input_from_gpu, output_from_gpu):
-        assert not input_from_gpu.is_cuda
-        assert not output_from_gpu.is_cuda
-        with torch.cuda.stream(self.cpu_stream):
-            loss = freivalds_algorithm(input_from_gpu, self.weight_t, output_from_gpu)
-            self.verify_event.record(self.cpu_stream)
-            return loss, None 
-
-    def verify_forward_finegrain(self, input_from_gpu, output_from_gpu):
-        self.compute_event.synchronize()
-        with torch.cuda.stream(self.cpu_stream):
-            input_cpu, e1 = copy_to_cpu(input_from_gpu, self.cpu_stream)
-            output_cpu, e2 = copy_to_cpu(output_from_gpu, self.cpu_stream)
-            if e1 is not None:
-                e1.synchronize()
-            if e2 is not None:
-                e2.synchronize()
-            self.cpu_stream.synchronize()
-            loss = freivalds_algorithm(input_cpu, self.weight_t, output_cpu)
-            self.verify_event.record(self.cpu_stream)
-            return loss, output_cpu
-
-
 def replace_linear(module: Module, gpu_stream, cpu_stream):
+    """DEPRECATED: Replace all nn.Linear children with SyncVerifyLinear."""
     for name, child in module.named_children():
         if isinstance(child, Linear):
-            new_layer = SyncVerifyLinear(
-                child, gpu_stream, cpu_stream
-            )
-
-            # Copy weights
+            new_layer = SyncVerifyLinear(child, gpu_stream, cpu_stream)
             new_layer.weight.data.copy_(child.weight.data)
             if child.bias is not None:
                 new_layer.bias.data.copy_(child.bias.data)
-
             setattr(module, name, new_layer)
-
         else:
             replace_linear(child, gpu_stream, cpu_stream)
+
+
+class VerifyLinear:
+    """Verified linear layer backed by VerifyRuntime for true async verification.
+
+    Accepts either the new VerifyRuntime API or the legacy (cpu_stream, gpu_stream) signature.
+    """
+
+    def __init__(self, linear, runtime_or_cpu_stream, tag_or_gpu_stream=None, noise=None):
+        from verified_diffusers.zimage.runtime import VerifyRuntime
+
+        self.linear = linear
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.noise = noise
+
+        if isinstance(runtime_or_cpu_stream, VerifyRuntime):
+            self.runtime = runtime_or_cpu_stream
+            self.tag = tag_or_gpu_stream or "linear"
+        else:
+            # Legacy signature: VerifyLinear(linear, cpu_stream, gpu_stream, noise)
+            self.runtime = None
+            self.tag = "linear"
+
+        self.weight_t_cpu = linear.weight.detach().t().to("cpu")
+        self.bias_cpu = linear.bias.detach().to("cpu") if linear.bias is not None else None
+
+    def forward(self, input):
+        out = F.linear(input, self.linear.weight, bias=None)
+        out = add_noise(out, self.noise)
+        if self.runtime is not None:
+            self.runtime.submit_linear(
+                tag=self.tag,
+                x_gpu=input,
+                y_gpu=out,
+                weight_t_cpu=self.weight_t_cpu,
+                bias_cpu=None,
+            )
+        return out
+
+    def add_bias(self, input):
+        if self.linear.bias is not None:
+            return input + self.linear.bias
+        return input
+
+
 
 class SparseLinearAlgo(enum.Enum):
     MASK = 1
@@ -451,44 +387,5 @@ def test_sparse_linear():
     linear = SparseLinear(hidden, seqlen, sparse_mask=mask)
     print(linear)
 
-def test_verify(batch, hidden, inter):
-    linear = Linear(hidden, inter, bias=False).to("cuda")
-    cuda_stream = torch.cuda.Stream()
-    cpu_stream = torch.cuda.Stream()
-    verify_linear = VerifyLinear(linear, cuda_stream, cpu_stream)
-
-    x = torch.randn(batch, hidden, device="cuda", requires_grad=False)
-    y = verify_linear.forward(x)
-
-    #cpu_stream.wait_event(verify_linear.compute_event)
-    print("Output from GPU: ", y)
-    loss, output_cpu = verify_linear.verify_forward(x, y)
-    # cpu_stream.wait_event(verify_linear.verify_event)
-    g_logger.info(f"All events issued: {cpu_stream.query()=}, {cuda_stream.query()=}")
-
-    print(f"Loss: {loss}")
-    pass
-
-def test_sync_verify():
-    import time
-    l1 = nn.Linear(3072, 4096).to("cuda")
-    sl1 = SyncVerifyLinear(l1, torch.cuda.default_stream(), torch.cuda.Stream())
-    inp = torch.randn(3072, 3072).to("cuda")
-
-    t1 = time.time()
-    for i in range(20):
-        l1_out = l1(inp)
-    t2 = time.time()
-    dur1 = (t2 - t1) / 20
-    print("Linear time ", dur1)
-
-    t1 = time.time()
-    for i in range(20):
-        sl1_out = sl1(inp)
-    t2 = time.time()
-    dur1 = (t2 - t1) / 20
-    print("Verify Linear time ", dur1)
-
 if __name__ == "__main__":
     test_sparse_linear()
-    #test_verify(32, 64, 128)

@@ -1,37 +1,41 @@
 """
-  Build llm models with verified linear
+Build LLM models with verified linear layers using VerifyRuntime.
 """
-from transformers import AutoModelForCausalLM, LlamaConfig
-from verified_llm.mlp_layer import LlamaMLPVerify, LlamaMLP
-from verified_llm.attn_layer import LlamaAttentionVerify , LlamaAttention
-from verified_llm.utils.log_utils import g_logger
-from verified_llm.utils.profiler import Profiler 
-import torch
+from __future__ import annotations
+
 import functools
+from typing import Optional
 
-def replace_param_attn(origin : LlamaAttention, stream_cpu, stream_gpu, noise):
-    new_linear = LlamaAttentionVerify(origin, stream_cpu, stream_gpu, noise)
-    return new_linear
+import torch
+from transformers import AutoModelForCausalLM
+from transformers.models.llama.modeling_llama import LlamaAttention, LlamaMLP
 
-def replace_attn(model, cpu, gpu, noise):
+from verified_diffusers.zimage.config import VerifyConfig
+from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_llm.attn_layer import LlamaAttentionVerify
+from verified_llm.mlp_layer import LlamaMLPVerify
+
+
+def replace_attn(model, runtime: VerifyRuntime, noise=None):
     for name, module in model.named_children():
         if isinstance(module, LlamaAttention):
-            veri_mlp = replace_param_attn(module, cpu, gpu, noise)
-            setattr(model, name, veri_mlp)
+            layer_idx = getattr(module, "layer_idx", name)
+            verified = LlamaAttentionVerify(
+                module, runtime, tag_prefix=f"layer{layer_idx}", noise=noise
+            )
+            setattr(model, name, verified)
         else:
-            replace_attn(module, cpu, gpu, noise)
+            replace_attn(module, runtime, noise)
 
-def replace_param_mlp(origin : LlamaMLP, stream_cpu, stream_gpu, noise):
-    new_linear = LlamaMLPVerify(origin, stream_cpu, stream_gpu, noise)
-    return new_linear
 
-def replace_mlp(model, cpu, gpu, noise):
+def replace_mlp(model, runtime: VerifyRuntime, noise=None):
     for name, module in model.named_children():
         if isinstance(module, LlamaMLP):
-            veri_mlp = replace_param_mlp(module, cpu, gpu, noise)
-            setattr(model, name, veri_mlp)
+            # Try to infer layer index from parent naming
+            verified = LlamaMLPVerify(module, runtime, tag_prefix=f"mlp.{name}", noise_scale=noise)
+            setattr(model, name, verified)
         else:
-            replace_mlp(module, cpu, gpu, noise)
+            replace_mlp(module, runtime, noise)
 
 
 def dump_layer_outputs(model):
@@ -46,20 +50,27 @@ def dump_layer_outputs(model):
             hooks.append(module.register_forward_hook(functools.partial(hook_fn, name)))
     return layer_outputs, hooks
 
-def create_llm_model(model_path, verify=False, cpu=None, gpu=None, noise=None):
+
+def create_llm_model(
+    model_path: str,
+    verify: bool = False,
+    config: Optional[VerifyConfig] = None,
+    noise=None,
+):
     model = AutoModelForCausalLM.from_pretrained(model_path)
     model.config._attn_implementation = "eager"
     model.to("cuda")
-    p = Profiler()
-    dur = p.add_time_span("attn")
-    if verify:
-        replace_attn(model, cpu, gpu, noise)
-        replace_mlp(model, cpu, gpu, noise)
 
+    runtime = None
+    if verify:
+        runtime = VerifyRuntime(config or VerifyConfig())
+        replace_attn(model, runtime, noise)
+        replace_mlp(model, runtime, noise)
+
+    model._verify_runtime = runtime
     return model
 
+
 if __name__ == "__main__":
-    cpu = torch.cuda.Stream()
-    gpu = torch.cuda.default_stream()
-    mod = create_llm_model("meta-llama/Llama-3.2-1B-Instruct", True, cpu, gpu)
+    mod = create_llm_model("meta-llama/Llama-3.2-1B-Instruct", verify=True)
     print(mod)
