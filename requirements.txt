@@ -1,10 +1,7 @@
-transformers
 torch
-tabulate
-datasets
-accelerate
-torchmetrics
-fire
-matplotlib
+transformers
 diffusers
 safetensors
+accelerate
+pandas
+matplotlib

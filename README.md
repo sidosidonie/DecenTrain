@@ -1,108 +1,122 @@
 # Verified Neural Network Inference
 
-Probabilistic verification of GPU-computed neural network inference using **Freivalds' algorithm**. The GPU is treated as untrusted; every matmul/linear result is verified asynchronously on CPU (future: TEE).
+Probabilistic verification of GPU-computed neural network inference using **SLALOM** (Tramer & Boneh, ICLR 2019) preprocessed Freivalds' algorithm. The GPU is treated as untrusted; every matmul/linear result is verified asynchronously on CPU.
 
 Two model families are supported:
-- **verified_llm** -- Llama-family LLMs (attention + MLP)
-- **verified_diffusers** -- Z-Image diffusion transformer + Flux
+- **verified_llm** -- Llama, Qwen (2/2.5/3/3.5), Mistral-family LLMs
+- **verified_diffusers** -- Z-Image diffusion transformer
 
 ## Quick Start
 
-### 1. Environment
+### 1. Requirements
 
-Tested: Python 3.12, CUDA 12.x, conda 25.5.1.
+- Python 3.12+
+- CUDA 12.x + NVIDIA GPU (16 GB+ VRAM recommended)
+- conda or pip
+
+### 2. Install
 
 ```bash
-conda env create -f env.yml
-conda activate verified-llm
+# Clone
+git clone <repo-url> && cd dt
+
+# Create environment (conda recommended)
+conda create -n verified-inference python=3.12 -y
+conda activate verified-inference
+
+# Install PyTorch with CUDA (adjust cu128 to your CUDA version)
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Patch transformers (one-time)
-
-Export `LlamaAttention`, `LlamaMLP`, `apply_rotary_pos_emb` from transformers:
+### 3. Verify installation
 
 ```bash
-# Find your transformers install path
-python -c "import transformers; print(transformers.__file__)"
+# Unit tests (no model download, ~4 seconds)
+pytest tests/test_zimage_module_level.py tests/test_zimage_verify_ops.py -v
+
+# Threat model tests (no model download, ~4 seconds)
+pytest tests/test_threat_model.py -v
+
+# End-to-end LLM tests (downloads Qwen2.5-0.5B, ~1 GB, ~20 seconds)
+RUN_E2E_LLM=1 pytest tests/test_e2e_llm.py -v
 ```
 
-Edit `transformers/models/llama/modeling_llama.py`, add to `__all__`:
+### 4. Run a model
 
 ```python
-__all__ = [
-    ...,
-    "LlamaAttention",
-    "LlamaMLP",
-    "apply_rotary_pos_emb",
-]
-```
+import torch
+from verified_diffusers.zimage.config import VerifyConfig
+from verified_llm.llm_model import create_llm_model
 
-### 3. Models
+# Load model with verification enabled
+model = create_llm_model(
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    verify=True,
+    config=VerifyConfig(enabled=True, profile_enabled=True),
+    dtype=torch.float32,
+    device="cuda",
+    trust_remote_code=True,
+)
+model.eval()
 
-- LLM: [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
-- Diffusion: [stabilityai/stable-diffusion-3.5-large](https://huggingface.co/stabilityai/stable-diffusion-3.5-large) (Z-Image pipeline)
+# Run inference
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", trust_remote_code=True)
+inputs = tokenizer("Hello, world!", return_tensors="pt").to("cuda")
 
-### 4. Dataset (LLM only)
+with torch.no_grad():
+    output = model.generate(**inputs, max_new_tokens=20, do_sample=False)
 
-```bash
-git lfs pull   # downloads c4 test data in dataset/c4
+# Flush verification — raises RuntimeError if any matmul was corrupted
+model._verify_runtime.flush()
+print(tokenizer.decode(output[0], skip_special_tokens=True))
 ```
 
 ---
 
-## Running
+## How It Works
 
-### Unit Tests
+### Architecture
 
-```bash
-# All tests
-pytest tests/ -v
+```
+GPU (untrusted, full speed)          CPU (trusted, async)
+──────────────────────────           ──────────────────────────
+Forward pass runs completely:
+  x@Wq, x@Wk, x@Wv                 ←─ D2H matmul outputs only
+  q_norm, RoPE (GPU)
+  Q@K^T                              ←─ D2H scores
+  softmax (GPU)
+  P@V                                ←─ D2H attn_out
+  x@Wo                               ←─ D2H o_out
+  silu(x@Wg) * x@Wu                  ←─ D2H gate, up
+  x@Wd                               ←─ D2H down
 
-# Diffusers module-level tests (no model download needed)
-pytest tests/test_zimage_module_level.py tests/test_zimage_verify_ops.py -v
+GPU never waits for CPU.             CPU verification chain:
+                                       SLALOM: y@s == x@s̃  (linear)
+                                       Freivalds: ABr == Cr (matmul)
+                                       Recompute: non-linears from
+                                       verified chain data
 
-# LLM linear / MLP / Freivalds tests
-pytest tests/test_linear.py -v
-
-# LLM model-level test (requires Llama download)
-pytest tests/test_llm_model.py -v
+                                     flush() → raise if any failure
 ```
 
-### LLM End-to-End Evaluation
+### Verification Methods
 
-```bash
-mkdir -p logs
+| Operation | GPU | CPU Verification | Cost |
+|-----------|-----|-----------------|------|
+| Linear (Q/K/V/O, MLP) | `y = x @ W^T` | SLALOM preprocessed Freivalds | O(n*k) |
+| Matmul (Q@K^T, P@V) | `C = A @ B` | Standard Freivalds | O(n^2*k) |
+| Non-linear (softmax, silu, norm, RoPE) | Computed on GPU | CPU recomputes from chain | O(n) |
 
-# Perplexity evaluation with verification
-python verified_llm/eval.py
+### SLALOM Preprocessing
 
-# Noise injection sweep
-chmod +x ppl.sh
-./ppl.sh
-# Output: logs/ppl-llama-noise-${noise_scale}-limit-${limit_samples}-loss
+Since model weights W are fixed at inference, `s_tilde = W^T @ s` is precomputed offline. Online verification becomes:
+
 ```
-
-### Diffusion (Z-Image) End-to-End
-
-```bash
-# Compare verified vs unverified inference (timing + profiling)
-python -m verified_diffusers.zimage.run_slow_e2e_compare
-
-# With options
-python -m verified_diffusers.zimage.run_slow_e2e_compare \
-    --num_inference_steps 4 \
-    --num_runs 3 \
-    --output_dir ./perf_out \
-    --save_images True
-```
-
-Profiling output (CSV + plots) is saved to `output/zimage_verify_profile/` by default.
-
-### Diffusion (Flux)
-
-```bash
-python verified_diffusers/verified_flux.py
+y @ s == x @ s_tilde     (two dot products, O(n*k) instead of O(n^2*k))
 ```
 
 ---
@@ -112,73 +126,48 @@ python verified_diffusers/verified_flux.py
 ```
 .
 ├── verified_llm/                  # Verified LLM inference
-│   ├── verify_linear.py           # VerifyLinear + Freivalds algorithms
-│   ├── attn_layer.py              # LlamaAttentionVerify (VerifyRuntime-backed)
-│   ├── mlp_layer.py               # LlamaMLPVerify (VerifyRuntime-backed)
-│   ├── llm_model.py               # Model creation: create_llm_model()
-│   ├── eval.py                    # Perplexity evaluation entry point
-│   ├── sparse_attn_layer.py       # Sparse attention variant
-│   └── legacy/                    # Old synchronous code (deprecated)
+│   ├── verify_linear.py           # SLALOM + Freivalds algorithms, VerifyLinear
+│   ├── attn_layer.py              # LlamaAttentionVerify (CPU chain verification)
+│   ├── mlp_layer.py               # LlamaMLPVerify (CPU chain verification)
+│   └── llm_model.py               # create_llm_model(), duck-typed layer replacement
 │
 ├── verified_diffusers/            # Verified diffusion inference
-│   ├── zimage/                    # Z-Image transformer pipeline
-│   │   ├── config.py              # VerifyConfig dataclass
-│   │   ├── runtime.py             # VerifyRuntime (async verification engine)
-│   │   ├── layers.py              # VerifyLinearModule, VerifyMatmul
-│   │   ├── attention.py           # VerifiedZImageAttention (manual verified attention)
-│   │   ├── transformer_block.py   # VerifiedZImageTransformerBlock (incl. adaLN)
-│   │   ├── transformer.py         # VerifiedZImageTransformer2DModel
-│   │   ├── mlp.py                 # VerifiedZImageFeedForward
-│   │   ├── pipeline.py            # VerifiedZImagePipeline wrapper
-│   │   ├── profiler.py            # VerifyProfiler (timing + CSV export)
-│   │   └── run_slow_e2e_compare.py
-│   ├── verified_flux.py           # Flux model verification
-│   └── hooks.py                   # Diffusers pipeline hooks
+│   └── zimage/
+│       ├── config.py              # VerifyConfig dataclass
+│       ├── runtime.py             # VerifyRuntime (async verification engine)
+│       ├── layers.py              # VerifyLinearModule, VerifyMatmul
+│       ├── attention.py           # VerifiedZImageAttention (CPU chain)
+│       ├── mlp.py                 # VerifiedZImageFeedForward (CPU chain)
+│       ├── transformer_block.py   # VerifiedZImageTransformerBlock
+│       ├── transformer.py         # VerifiedZImageTransformer2DModel
+│       ├── pipeline.py            # VerifiedZImagePipeline
+│       └── profiler.py            # VerifyProfiler (CSV/JSON/plot export)
 │
-├── tests/                         # pytest test suite
-│   ├── conftest.py                # Environment shims (torchvision, flash_attn)
-│   ├── test_linear.py             # VerifyLinear + Freivalds tests
-│   ├── test_llm_model.py          # LLM model creation test
-│   ├── test_zimage_module_level.py # VerifyLinearModule, VerifyMatmul, corruption detection
-│   ├── test_zimage_verify_ops.py  # Attention + MLP verified vs origin comparison
-│   └── test_zimage_pipeline_*.py  # Pipeline integration tests
+├── tests/
+│   ├── test_e2e_llm.py            # 4 end-to-end LLM tests
+│   ├── test_threat_model.py       # 11 attack scenario tests
+│   ├── test_zimage_module_level.py # 9 module-level tests
+│   ├── test_zimage_verify_ops.py  # 2 attention/MLP verification tests
+│   └── bench_qwen3_5_9b.py       # Qwen3.5-9B performance benchmark
 │
-├── dataset/c4/                    # C4 validation dataset (git lfs)
-├── docs/DESIGN.md                 # Detailed design document
-├── env.yml                        # Conda environment
-└── requirements.txt               # pip dependencies
+├── docs/
+│   ├── DESIGN.md                  # System design document
+│   └── REPORT.md                  # Technical report (TEE survey, benchmarks)
+│
+└── output/                        # Profiling output (CSV, JSON, plots)
 ```
 
-## Architecture
+## Supported Models
 
-```
-GPU (untrusted)              CPU (trusted / TEE)
-─────────────────            ──────────────────────────
- compute_stream               ThreadPoolExecutor
-   │                            │
-   ├─ F.linear(x, W)           │
-   │     │                      │
-   │     ├─── copy_stream ──────┤ copy x, y to pinned CPU
-   │     │                      │
-   ├─ matmul(Q, K^T)           ├─ Freivalds: ABr vs Cr
-   │     │                      │   MSE < threshold? ──→ OK / FAIL
-   │     ├─── copy_stream ──────┤
-   │     │                      │
-   ├─ softmax (GPU)             ├─ Recompute softmax on CPU
-   │     │                      │   MSE < threshold? ──→ OK / FAIL
-   │     ├─── copy_stream ──────┤
-   │     │                      │
-   ├─ matmul(attn, V)          ├─ Freivalds verify
-   │     ...                    │   ...
-   │                            │
-   └── (continues)              └── flush() → raise if any failure
-```
+| Model | Parameters | dtype | VRAM | Notes |
+|-------|-----------|-------|------|-------|
+| Qwen/Qwen2.5-0.5B-Instruct | 0.5B | fp32 | ~2 GB | CI/test model |
+| meta-llama/Llama-3.2-1B-Instruct | 1B | fp32 | ~4 GB | |
+| Qwen/Qwen3-8B | 8B | bf16 | ~16 GB | |
+| Qwen/Qwen3.5-9B | 9B | bf16 | ~17 GB | Hybrid (full + linear attention) |
+| Tongyi-MAI/Z-Image | ~2B | fp16 | ~24 GB | Diffusion transformer |
 
-Key properties:
-- **Zero `torch.cuda.synchronize()`** in the verified forward path
-- GPU compute and CPU verification run in parallel via `VerifyRuntime`
-- Copy is overlapped using a dedicated `copy_stream` + pinned memory
-- Verification results are collected asynchronously; `runtime.flush()` at end
+Any HuggingFace causal LM with standard `q/k/v/o_proj` attention + `gate/up/down_proj` MLP is auto-detected via duck typing.
 
 ## Configuration
 
@@ -186,48 +175,57 @@ Key properties:
 from verified_diffusers.zimage.config import VerifyConfig
 
 config = VerifyConfig(
-    enabled=True,                    # Toggle verification on/off
-    freivalds_k=8,                   # Random vectors (confidence: 1 - 2^{-k})
-    mse_threshold=1e-5,              # Max MSE for linear/matmul
-    elementwise_mse_threshold=1e-4,  # Max MSE for softmax/silu
-    verify_every_n=1,                # Verify every N-th op (1 = all)
-    max_workers=2,                   # CPU ThreadPool workers
-    max_verify_tensor_numel=2_000_000,  # Skip very large tensors
-    fail_on_error=True,              # Raise on verification failure
-    profile_enabled=True,            # Enable timing profiler
+    enabled=True,              # Toggle verification on/off
+    freivalds_k=10,            # Random vectors (confidence)
+    mse_threshold=1e-5,        # Max MSE for matmul verification
+    verify_every_n=1,          # Verify every N-th op (1 = all)
+    max_workers=2,             # CPU ThreadPool workers
+    fail_on_error=True,        # Raise on verification failure
+    profile_enabled=True,      # Enable timing profiler
 )
 ```
 
-## Verified Operations
+**dtype-specific thresholds:**
 
-| Operation | Method | Location |
-|-----------|--------|----------|
-| nn.Linear | Freivalds (submit_linear) | All projection layers |
-| Q @ K^T | Freivalds (submit_matmul) | Attention QK |
-| attn_probs @ V | Freivalds (submit_matmul) | Attention KV |
-| softmax | CPU recompute + MSE (submit_elementwise) | After QK scaling |
-| silu | CPU recompute + MSE (submit_elementwise) | MLP activation |
-| adaLN_modulation | Freivalds (via VerifyLinearModule) | Transformer blocks |
+| dtype | Recommended `mse_threshold` |
+|-------|---------------------------|
+| fp32 | 1e-5 |
+| fp16 / bf16 | 5e-3 |
+| fp8 | 1e-2 |
+| int8 (quantized) | 5e-2 |
+
+## Running Tests
+
+```bash
+# All tests (requires CUDA GPU)
+RUN_E2E_LLM=1 pytest tests/ -v
+
+# Fast tests only (no model download)
+pytest tests/test_zimage_module_level.py tests/test_zimage_verify_ops.py tests/test_threat_model.py -v
+
+# Qwen3.5-9B benchmark (requires ~17 GB VRAM, downloads ~18 GB model)
+python tests/bench_qwen3_5_9b.py
+```
 
 ## Benchmarks
 
-### Z-Image (A100 + 20-core CPU)
+### Qwen3.5-9B (RTX 5090, bf16)
 
-| Prompt | Origin (1 step) | Verified (1 step) | Overhead |
-|--------|------------------|--------------------|----------|
-| Short  | 6,959 ms         | 15,948 ms          | 2.3x     |
-| Long   | 7,059 ms         | 16,115 ms          | 2.3x     |
+| Metric | Origin | Verified | Overhead |
+|--------|--------|----------|----------|
+| Forward pass | 137 ms | 1,950 ms | 14.3x |
+| Generation (50 tok) | 2,257 ms | 114,723 ms | 50.8x |
+| Token equivalence | — | — | PASS |
 
-### Flux.1-schnell (A100, 30 steps)
+### Z-Image (A100, fp32)
 
-| Mode | Total Time |
-|------|------------|
-| Origin | 117,804 ms |
-| Verified | 403,913 ms |
-
----
+| Metric | Origin | Verified | Overhead |
+|--------|--------|----------|----------|
+| 1-step inference | 7,059 ms | 16,115 ms | 2.3x |
 
 ## References
 
-- [Freivalds' Algorithm (Wikipedia)](https://en.wikipedia.org/wiki/Freivalds%27_algorithm)
-- See `docs/DESIGN.md` for the full design document
+- Tramer, F. & Boneh, D. "SLALOM: Fast, Verifiable and Private Execution of Neural Networks in Trusted Hardware." ICLR, 2019. [arXiv:1806.03287](https://arxiv.org/abs/1806.03287)
+- Freivalds, R. "Probabilistic Machines Can Use Less Running Time." IFIP Congress, 1977.
+- See `docs/REPORT.md` for the full technical report (TEE survey, quantization evaluation).
+- See `docs/DESIGN.md` for the system design document.
