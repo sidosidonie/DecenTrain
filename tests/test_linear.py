@@ -47,7 +47,7 @@ def test_mlp(batch, noise_scale):
     config = VerifyConfig(enabled=True, fail_on_error=True, profile_enabled=False)
     runtime = VerifyRuntime(config)
 
-    llama_config = LlamaConfig("meta-llama/Llama-3.2-1B-Instruct")
+    llama_config = LlamaConfig()
     origin_mlp = LlamaMLP(llama_config).to("cuda")
     verify_mlp = LlamaMLPVerify(origin_mlp, runtime, noise_scale=noise_scale)
 

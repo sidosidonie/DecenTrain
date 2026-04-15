@@ -217,6 +217,7 @@ def copy_to_cpu(x_device: torch.Tensor, stream_copy: torch.cuda.Stream):
         x_host = torch.empty_like(x_device, device="cpu", pin_memory=True)
         e = torch.cuda.Event()
         with torch.cuda.stream(stream_copy):
+            x_device.record_stream(stream_copy)
             x_host.copy_(x_device, non_blocking=True)
             e.record(stream_copy)
         return x_host, e
