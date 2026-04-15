@@ -2,5 +2,5 @@
 **/logs
 .idea
 .vscode
-
-
+output/
+*.egg-info/
