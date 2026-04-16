@@ -27,7 +27,9 @@ def test_linear(batch, hidden, inter, bias):
     y_origin = origin_linear(x)
     y_v = verify_linear.forward(x)
     y_v_bias = verify_linear.add_bias(y_v)
-    assert torch.allclose(y_origin, y_v_bias)
+    # cuBLAS may fuse bias into the GEMM epilogue, so origin (fused) and
+    # verify (separate add) can differ by a handful of fp32 ULPs.
+    assert torch.allclose(y_origin, y_v_bias, atol=1e-4, rtol=1e-4)
 
     runtime.flush()
     runtime.shutdown()
@@ -54,7 +56,7 @@ def test_mlp(batch, noise_scale):
     x = torch.randn(batch, llama_config.hidden_size, device="cuda", requires_grad=False)
     y = origin_mlp.forward(x)
     y_v = verify_mlp.forward(x)
-    assert torch.allclose(y, y_v)
+    assert torch.allclose(y, y_v, atol=1e-4, rtol=1e-4)
 
     runtime.flush()
     runtime.shutdown()

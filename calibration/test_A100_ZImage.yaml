@@ -1,0 +1,47 @@
+calibration:
+  version: 1
+  timestamp: "2026-04-16T00:00:00"
+  machine:
+    cpu: "Intel Xeon 8480+"
+    cpu_cores: 56
+    gpu: "NVIDIA A100-SXM4-80GB"
+    gpu_count: 1
+    gpu_memory_gb: 80
+    pytorch: "2.9.0"
+  benchmark:
+    model: "Tongyi-MAI/Z-Image"
+    model_type: diffusion
+    dtype: bf16
+    freivalds_k: 4
+    num_steps: 1
+  measured:
+    origin:
+      total_ms: 7059.0
+      per_step_ms: 7059.0
+    verified:
+      total_ms: 16115.0
+      per_step_ms: 16115.0
+      overhead: 2.28
+  profiler:
+    total_checks: 300
+    total_failures: 12
+    pass_rate_pct: 96.0
+    skipped: 0
+    linear_verify:
+      count: 210
+      avg_ms: 35.2
+    matmul_verify:
+      count: 60
+      avg_ms: 12.8
+    elementwise_verify:
+      count: 30
+      avg_ms: 2.1
+    transfer_linear_avg_ms: 0.8
+    transfer_matmul_avg_ms: 2.5
+  factors:
+    gpu_step_ms: 7059.0
+    verified_step_ms: 16115.0
+    linear_verify_ms: 35.2
+    matmul_verify_ms: 12.8
+    transfer_linear_ms: 0.8
+    transfer_matmul_ms: 2.5

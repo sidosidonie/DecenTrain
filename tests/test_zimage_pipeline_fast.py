@@ -16,6 +16,16 @@ from verified_diffusers.zimage.transformer import VerifiedZImageTransformer2DMod
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
+@pytest.fixture(autouse=True)
+def _drain_cuda():
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    yield
+
+
 @torch.no_grad()
 def test_verified_transformer_matches_origin_small_model():
     model = ZImageTransformer2DModel(

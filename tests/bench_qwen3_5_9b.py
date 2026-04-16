@@ -1,9 +1,9 @@
 """
 Qwen3.5-9B end-to-end benchmark with verified inference profiling.
 
-Runs on RTX 5090 (32GB) with bf16. Measures:
-  - Origin vs verified forward-pass latency
-  - Greedy generation tok/s
+Measures prefill and decode phases separately:
+  - Prefill: single forward pass over the full prompt (KV cache fill)
+  - Decode: autoregressive token-by-token generation
   - Verification overhead breakdown (D2H transfer, Freivalds, elementwise)
   - Profiling export (CSV, JSON, plot)
 
@@ -94,6 +94,70 @@ def probe_architecture():
     return text_cfg
 
 
+# ── Greedy generation with prefill/decode timing ──────────────────────────
+
+def _greedy_generate(model, input_ids, max_new_tokens, runtime=None):
+    """Manual greedy generation loop that separately times prefill and decode.
+
+    Returns (output_ids, prefill_ms, decode_ms, per_token_ms_list).
+    """
+    generated = input_ids.clone()
+
+    # ── Prefill ──
+    torch.cuda.synchronize()
+    t_prefill_start = time.perf_counter()
+
+    out = model(input_ids=input_ids, use_cache=True)
+    past = out.past_key_values
+    if runtime:
+        runtime.flush()
+    torch.cuda.synchronize()
+    t_prefill_end = time.perf_counter()
+
+    prefill_ms = (t_prefill_end - t_prefill_start) * 1000
+    next_token = out.logits[:, -1:].argmax(dim=-1)
+    generated = torch.cat([generated, next_token], dim=-1)
+
+    # ── Decode ──
+    per_token_ms = []
+    eos_id = getattr(model.config, "eos_token_id", None)
+    if isinstance(eos_id, list):
+        eos_id = set(eos_id)
+    elif eos_id is not None:
+        eos_id = {eos_id}
+    else:
+        eos_id = set()
+
+    torch.cuda.synchronize()
+    t_decode_start = time.perf_counter()
+
+    for step in range(max_new_tokens - 1):
+        t_tok_start = time.perf_counter()
+        out = model(
+            input_ids=next_token,
+            past_key_values=past,
+            use_cache=True,
+        )
+        past = out.past_key_values
+        if runtime:
+            runtime.flush()
+        torch.cuda.synchronize()
+        t_tok_end = time.perf_counter()
+
+        per_token_ms.append((t_tok_end - t_tok_start) * 1000)
+        next_token = out.logits[:, -1:].argmax(dim=-1)
+        generated = torch.cat([generated, next_token], dim=-1)
+
+        if next_token.item() in eos_id:
+            break
+
+    torch.cuda.synchronize()
+    t_decode_end = time.perf_counter()
+    decode_ms = (t_decode_end - t_decode_start) * 1000
+
+    return generated, prefill_ms, decode_ms, per_token_ms
+
+
 # ── Step 2: Origin baseline ─────────────────────────────────────────────────
 
 def benchmark_origin(tokenizer):
@@ -121,7 +185,7 @@ def benchmark_origin(tokenizer):
             _ = model(**inputs)
     torch.cuda.synchronize()
 
-    # Timed forward passes
+    # Timed forward passes (prefill only, no KV cache)
     fwd_times = []
     with torch.no_grad():
         for i in range(TIMED_RUNS):
@@ -136,38 +200,46 @@ def benchmark_origin(tokenizer):
     print(f"  Forward pass (avg {TIMED_RUNS} runs): {avg_fwd:.1f} ms")
     print(f"  Forward pass times: {[f'{t:.1f}' for t in fwd_times]}")
 
-    # Timed generation
+    # Timed generation with prefill/decode split
     gen_inputs = _tokenize(tokenizer, PROMPT)
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        out = model.generate(
-            **gen_inputs, max_new_tokens=GEN_MAX_TOKENS, do_sample=False,
-        )
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
-
-    gen_time = (t1 - t0) * 1000
     n_input = gen_inputs["input_ids"].shape[1]
-    n_output = out.shape[1] - n_input
-    tok_per_sec = n_output / (gen_time / 1000) if gen_time > 0 else 0
 
-    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    with torch.no_grad():
+        out_ids, prefill_ms, decode_ms, per_tok = _greedy_generate(
+            model, gen_inputs["input_ids"], GEN_MAX_TOKENS,
+        )
+
+    n_output = out_ids.shape[1] - n_input
+    gen_time = prefill_ms + decode_ms
+    decode_tok_per_sec = len(per_tok) / (decode_ms / 1000) if decode_ms > 0 else 0
+    avg_tok_ms = sum(per_tok) / len(per_tok) if per_tok else 0
+
+    text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
     peak_mem = _gpu_peak_mb()
 
-    print(f"  Generation: {n_output} tokens in {gen_time:.1f} ms ({tok_per_sec:.1f} tok/s)")
+    print(f"  Prefill:  {n_input} tokens in {prefill_ms:.1f} ms "
+          f"({n_input / (prefill_ms / 1000):.0f} tok/s)")
+    print(f"  Decode:   {len(per_tok)} tokens in {decode_ms:.1f} ms "
+          f"({decode_tok_per_sec:.1f} tok/s, avg {avg_tok_ms:.1f} ms/tok)")
+    print(f"  Total:    {n_output} tokens in {gen_time:.1f} ms")
     print(f"  Peak VRAM: {peak_mem:.0f} MB")
     print(f"  Output: {text[:200]!r}...")
 
     results = {
         "fwd_avg_ms": avg_fwd,
         "fwd_times": fwd_times,
+        "prefill_ms": prefill_ms,
+        "prefill_tokens": n_input,
+        "decode_ms": decode_ms,
+        "decode_tokens": len(per_tok),
+        "decode_tok_per_sec": decode_tok_per_sec,
+        "decode_avg_tok_ms": avg_tok_ms,
+        "per_token_ms": per_tok,
         "gen_time_ms": gen_time,
         "gen_tokens": n_output,
-        "tok_per_sec": tok_per_sec,
         "peak_vram_mb": peak_mem,
         "text": text,
-        "output_ids": out.cpu(),
+        "output_ids": out_ids.cpu(),
     }
 
     _free_model(model)
@@ -217,7 +289,7 @@ def benchmark_verified(tokenizer):
     runtime.clear_errors()
     runtime.profiler._records.clear()
 
-    # Timed forward passes
+    # Timed forward passes (prefill only, no KV cache)
     fwd_times = []
     with torch.no_grad():
         for i in range(TIMED_RUNS):
@@ -241,30 +313,31 @@ def benchmark_verified(tokenizer):
     runtime.profiler._records.clear()
     runtime._errors.clear()
 
-    # Timed generation
+    # Timed generation with prefill/decode split
     gen_inputs = _tokenize(tokenizer, PROMPT)
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        out = model.generate(
-            **gen_inputs, max_new_tokens=GEN_MAX_TOKENS, do_sample=False,
-        )
-    runtime.flush()
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
-
-    gen_time = (t1 - t0) * 1000
     n_input = gen_inputs["input_ids"].shape[1]
-    n_output = out.shape[1] - n_input
-    tok_per_sec = n_output / (gen_time / 1000) if gen_time > 0 else 0
 
-    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    with torch.no_grad():
+        out_ids, prefill_ms, decode_ms, per_tok = _greedy_generate(
+            model, gen_inputs["input_ids"], GEN_MAX_TOKENS, runtime=runtime,
+        )
+
+    n_output = out_ids.shape[1] - n_input
+    gen_time = prefill_ms + decode_ms
+    decode_tok_per_sec = len(per_tok) / (decode_ms / 1000) if decode_ms > 0 else 0
+    avg_tok_ms = sum(per_tok) / len(per_tok) if per_tok else 0
+
+    text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
     peak_mem = _gpu_peak_mb()
 
     records_gen = list(runtime.profiler.records)
     n_fail_gen = sum(1 for r in records_gen if not r.ok)
 
-    print(f"  Generation: {n_output} tokens in {gen_time:.1f} ms ({tok_per_sec:.1f} tok/s)")
+    print(f"  Prefill:  {n_input} tokens in {prefill_ms:.1f} ms "
+          f"({n_input / (prefill_ms / 1000):.0f} tok/s)")
+    print(f"  Decode:   {len(per_tok)} tokens in {decode_ms:.1f} ms "
+          f"({decode_tok_per_sec:.1f} tok/s, avg {avg_tok_ms:.1f} ms/tok)")
+    print(f"  Total:    {n_output} tokens in {gen_time:.1f} ms")
     print(f"  Peak VRAM: {peak_mem:.0f} MB")
     print(f"  Verify checks (generation): {len(records_gen)} total, {n_fail_gen} failures")
     print(f"  Output: {text[:200]!r}...")
@@ -286,12 +359,18 @@ def benchmark_verified(tokenizer):
     results = {
         "fwd_avg_ms": avg_fwd,
         "fwd_times": fwd_times,
+        "prefill_ms": prefill_ms,
+        "prefill_tokens": n_input,
+        "decode_ms": decode_ms,
+        "decode_tokens": len(per_tok),
+        "decode_tok_per_sec": decode_tok_per_sec,
+        "decode_avg_tok_ms": avg_tok_ms,
+        "per_token_ms": per_tok,
         "gen_time_ms": gen_time,
         "gen_tokens": n_output,
-        "tok_per_sec": tok_per_sec,
         "peak_vram_mb": peak_mem,
         "text": text,
-        "output_ids": out.cpu(),
+        "output_ids": out_ids.cpu(),
         "n_checks_fwd": len(records_fwd),
         "n_fail_fwd": n_fail_fwd,
         "n_checks_gen": len(records_gen),
@@ -319,16 +398,25 @@ def print_report(origin, verified):
     print(f"  Architecture: Hybrid (8 full_attention verified + 24 linear_attention pass-through)")
     print(f"  Verified: 8 attention + 32 MLP layers")
 
-    # Forward pass comparison
-    fwd_overhead = verified["fwd_avg_ms"] / origin["fwd_avg_ms"] if origin["fwd_avg_ms"] > 0 else float("inf")
+    def _ratio(a, b):
+        return a / b if b > 0 else float("inf")
+
+    fwd_overhead = _ratio(verified["fwd_avg_ms"], origin["fwd_avg_ms"])
+    prefill_overhead = _ratio(verified["prefill_ms"], origin["prefill_ms"])
+    decode_overhead = _ratio(verified["decode_ms"], origin["decode_ms"])
+    gen_overhead = _ratio(verified["gen_time_ms"], origin["gen_time_ms"])
+
     print(f"\n  {'Metric':<30} {'Origin':>12} {'Verified':>12} {'Overhead':>10}")
     print(f"  {'-'*64}")
     print(f"  {'Forward pass (ms)':<30} {origin['fwd_avg_ms']:>12.1f} {verified['fwd_avg_ms']:>12.1f} {fwd_overhead:>9.2f}x")
-
-    # Generation comparison
-    gen_overhead = verified["gen_time_ms"] / origin["gen_time_ms"] if origin["gen_time_ms"] > 0 else float("inf")
-    print(f"  {'Generation (ms)':<30} {origin['gen_time_ms']:>12.1f} {verified['gen_time_ms']:>12.1f} {gen_overhead:>9.2f}x")
-    print(f"  {'Tokens/sec':<30} {origin['tok_per_sec']:>12.1f} {verified['tok_per_sec']:>12.1f} {'':>10}")
+    print(f"  {'Prefill (ms)':<30} {origin['prefill_ms']:>12.1f} {verified['prefill_ms']:>12.1f} {prefill_overhead:>9.2f}x")
+    print(f"  {'  input tokens':<30} {origin['prefill_tokens']:>12} {verified['prefill_tokens']:>12} {'':>10}")
+    print(f"  {'  prefill tok/s':<30} {origin['prefill_tokens']/(origin['prefill_ms']/1000):>12.0f} {verified['prefill_tokens']/(verified['prefill_ms']/1000):>12.0f} {'':>10}")
+    print(f"  {'Decode (ms)':<30} {origin['decode_ms']:>12.1f} {verified['decode_ms']:>12.1f} {decode_overhead:>9.2f}x")
+    print(f"  {'  output tokens':<30} {origin['decode_tokens']:>12} {verified['decode_tokens']:>12} {'':>10}")
+    print(f"  {'  decode tok/s':<30} {origin['decode_tok_per_sec']:>12.1f} {verified['decode_tok_per_sec']:>12.1f} {'':>10}")
+    print(f"  {'  avg ms/tok':<30} {origin['decode_avg_tok_ms']:>12.1f} {verified['decode_avg_tok_ms']:>12.1f} {'':>10}")
+    print(f"  {'Total generation (ms)':<30} {origin['gen_time_ms']:>12.1f} {verified['gen_time_ms']:>12.1f} {gen_overhead:>9.2f}x")
     print(f"  {'Peak VRAM (MB)':<30} {origin['peak_vram_mb']:>12.0f} {verified['peak_vram_mb']:>12.0f} {'':>10}")
 
     # Token equivalence
