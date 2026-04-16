@@ -1,0 +1,33 @@
+# Home setup: TDX Xeon + RTX 5090 + RTX 4090, mixed GPU cluster
+# 5090 runs the larger model, 4090 runs a smaller one
+
+cpu:
+  type: Xeon-8480+
+  tee: tdx
+
+clusters:
+  - name: "llm-9b"
+    gpu_type: RTX-5090
+    count: 1
+    strategy: standalone
+    model: Qwen3.5-9B
+
+  - name: "llm-1b"
+    gpu_type: RTX-4090
+    count: 1
+    strategy: standalone
+    model: Llama-3.2-1B
+
+network:
+  type: 10GbE
+
+verify:
+  use_slalom: true
+  freivalds_k: 10
+  verify_every_n: 1
+  compression: fp16
+
+inference:
+  batch_size: 1
+  seq_len: 32
+  gen_tokens: 50

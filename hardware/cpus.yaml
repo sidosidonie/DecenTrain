@@ -1,0 +1,81 @@
+# CPU Hardware Definitions
+# Each entry defines a CPU type with compute and memory specs.
+# Reference by name in system configs: cpu_type: Xeon-8480+
+
+# ── Intel Xeon (TDX capable: Sapphire Rapids+) ──
+
+Xeon-8480+:
+  cores: 56
+  fp32_gflops: 2150
+  memory_bw_gbps: 307          # 8-ch DDR5-4800
+  tee_support: [tdx, sgx]
+
+Xeon-8490H:
+  cores: 60
+  fp32_gflops: 2300
+  memory_bw_gbps: 307
+  tee_support: [tdx, sgx]
+
+Xeon-w9-3595X:
+  cores: 60
+  fp32_gflops: 2600
+  memory_bw_gbps: 307
+  tee_support: [tdx]
+
+Xeon-6980P:
+  cores: 128
+  fp32_gflops: 3500
+  memory_bw_gbps: 410          # 8-ch DDR5-6400 (Granite Rapids)
+  tee_support: [tdx, sgx]
+
+# ── AMD EPYC (SEV-SNP capable: Milan+) ──
+
+EPYC-9654:
+  cores: 96
+  fp32_gflops: 3072
+  memory_bw_gbps: 461          # 12-ch DDR5-4800 (Genoa)
+  tee_support: [sev-snp]
+
+EPYC-9754:
+  cores: 128
+  fp32_gflops: 3200
+  memory_bw_gbps: 461
+  tee_support: [sev-snp]
+
+EPYC-9755:
+  cores: 128
+  fp32_gflops: 3300
+  memory_bw_gbps: 461
+  tee_support: [sev-snp]
+
+2xEPYC-9754:
+  cores: 256
+  fp32_gflops: 6400
+  memory_bw_gbps: 922          # dual socket
+  tee_support: [sev-snp]
+
+# ── Consumer / Workstation (no TEE) ──
+
+i9-14900K:
+  cores: 24
+  fp32_gflops: 900
+  memory_bw_gbps: 90           # 2-ch DDR5-5600
+  tee_support: []
+
+i9-13900K:
+  cores: 24
+  fp32_gflops: 850
+  memory_bw_gbps: 76           # 2-ch DDR5-4800
+  tee_support: []
+
+Ryzen-9950X:
+  cores: 16
+  fp32_gflops: 600
+  memory_bw_gbps: 76
+  tee_support: []
+
+Apple-M4-Ultra:
+  cores: 32
+  fp32_gflops: 1400
+  memory_bw_gbps: 800          # unified memory
+  tee_support: []

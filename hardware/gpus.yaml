@@ -1,0 +1,88 @@
+# GPU Hardware Definitions
+# Each entry defines a GPU type with its compute and memory specs.
+# Reference by name in system configs: gpu_type: RTX-4090
+#
+# To add a custom GPU, just add a new entry following this format.
+
+RTX-3090:
+  bf16_tflops: 71
+  memory_gb: 24
+  memory_bw_gbps: 936          # GDDR6X bandwidth
+  pcie_gen: 4
+  nvlink: false
+
+RTX-4090:
+  bf16_tflops: 165
+  memory_gb: 24
+  memory_bw_gbps: 1008         # GDDR6X bandwidth
+  pcie_gen: 4
+  nvlink: false
+
+RTX-5090:
+  bf16_tflops: 419
+  memory_gb: 32
+  memory_bw_gbps: 1792         # GDDR7 bandwidth
+  pcie_gen: 5
+  nvlink: false
+
+A100-40G:
+  bf16_tflops: 312
+  memory_gb: 40
+  memory_bw_gbps: 1555         # HBM2e
+  pcie_gen: 4
+  nvlink: true
+  nvlink_bw_gbps: 600          # NVLink 3.0, 12 links
+
+A100-80G:
+  bf16_tflops: 312
+  memory_gb: 80
+  memory_bw_gbps: 2039         # HBM2e
+  pcie_gen: 4
+  nvlink: true
+  nvlink_bw_gbps: 600
+
+H100-SXM:
+  bf16_tflops: 990
+  memory_gb: 80
+  memory_bw_gbps: 3350         # HBM3
+  pcie_gen: 5
+  nvlink: true
+  nvlink_bw_gbps: 900          # NVLink 4.0, 18 links
+
+H100-PCIe:
+  bf16_tflops: 756
+  memory_gb: 80
+  memory_bw_gbps: 2039         # HBM3
+  pcie_gen: 5
+  nvlink: false
+
+H200:
+  bf16_tflops: 990
+  memory_gb: 141
+  memory_bw_gbps: 4800         # HBM3e
+  pcie_gen: 5
+  nvlink: true
+  nvlink_bw_gbps: 900
+
+B200:
+  bf16_tflops: 2250
+  memory_gb: 192
+  memory_bw_gbps: 8000         # HBM3e
+  pcie_gen: 5
+  nvlink: true
+  nvlink_bw_gbps: 1800         # NVLink 5.0
+
+L40S:
+  bf16_tflops: 183
+  memory_gb: 48
+  memory_bw_gbps: 864          # GDDR6
+  pcie_gen: 4
+  nvlink: false
+
+A6000:
+  bf16_tflops: 155
+  memory_gb: 48
+  memory_bw_gbps: 768          # GDDR6
+  pcie_gen: 4
+  nvlink: true
+  nvlink_bw_gbps: 112          # NVLink bridge (2-GPU only)

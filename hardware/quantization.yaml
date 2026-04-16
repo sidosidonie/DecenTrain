@@ -1,0 +1,172 @@
+# Quantization Method Definitions
+# Each entry defines how a quantization scheme affects performance and verification.
+#
+# Fields:
+#   weight_bits:      effective weight precision
+#   activation_bits:  activation precision during matmul
+#   memory_factor:    model VRAM multiplier vs bf16 (0.25 = 4x smaller)
+#   compute_factor:   GPU throughput multiplier (>1 = faster)
+#   threshold_factor: MSE threshold multiplier vs bf16 (wider = more tolerant)
+#   kv_cache_bits:    KV cache precision (0 = same as activation)
+#   verify_compatible: full | partial | none
+#   notes:            human-readable description
+
+# ── No Quantization ──
+
+none:
+  weight_bits: 16
+  activation_bits: 16
+  memory_factor: 1.0
+  compute_factor: 1.0
+  threshold_factor: 1.0
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "bf16/fp16 baseline, no quantization"
+
+# ── Weight-Only Quantization (most common for LLMs) ──
+
+gptq-4bit:
+  weight_bits: 4
+  activation_bits: 16
+  memory_factor: 0.28           # 4-bit weights + scales/zeros overhead
+  compute_factor: 1.3           # Marlin kernel speedup from reduced memory reads
+  threshold_factor: 5.0         # wider threshold for dequant rounding
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "GPTQ 4-bit weight-only. Dequant to fp16 before matmul. Marlin kernel."
+
+gptq-3bit:
+  weight_bits: 3
+  activation_bits: 16
+  memory_factor: 0.22
+  compute_factor: 1.2
+  threshold_factor: 10.0
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "GPTQ 3-bit. Higher quantization noise."
+
+awq-4bit:
+  weight_bits: 4
+  activation_bits: 16
+  memory_factor: 0.28
+  compute_factor: 1.3
+  threshold_factor: 5.0
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "AWQ 4-bit weight-only. Per-channel scaling."
+
+nf4:
+  weight_bits: 4
+  activation_bits: 16
+  memory_factor: 0.28
+  compute_factor: 1.0           # bitsandbytes NF4 is slower than Marlin
+  threshold_factor: 5.0
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "bitsandbytes NF4 (QLoRA-style). Double quantization."
+
+gguf-q4km:
+  weight_bits: 4
+  activation_bits: 16
+  memory_factor: 0.30           # block-wise quant has slightly more overhead
+  compute_factor: 1.2
+  threshold_factor: 5.0
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "GGUF Q4_K_M format. Block-wise dequant."
+
+gguf-q5ks:
+  weight_bits: 5
+  activation_bits: 16
+  memory_factor: 0.38
+  compute_factor: 1.1
+  threshold_factor: 3.0
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "GGUF Q5_K_S format. Better quality than Q4."
+
+# ── Weight+Activation Quantization ──
+
+w8a8-smoothquant:
+  weight_bits: 8
+  activation_bits: 8
+  memory_factor: 0.50
+  compute_factor: 1.8           # INT8 tensor cores ~2x throughput
+  threshold_factor: 10.0
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "SmoothQuant W8A8. INT8 matmul with per-tensor/channel scaling."
+
+fp8-e4m3:
+  weight_bits: 8
+  activation_bits: 8
+  memory_factor: 0.50
+  compute_factor: 2.0           # H100/B200 FP8 tensor cores
+  threshold_factor: 2.0         # FP8 output is fp16, relatively clean
+  kv_cache_bits: 16
+  verify_compatible: full
+  notes: "FP8 E4M3 on H100+. Native tensor core support. Output is fp16."
+
+int8-bitsandbytes:
+  weight_bits: 8
+  activation_bits: 16
+  memory_factor: 0.55
+  compute_factor: 1.1
+  threshold_factor: 10.0
+  kv_cache_bits: 16
+  verify_compatible: partial
+  notes: "bitsandbytes INT8. Mixed decomposition (outlier fp16 + main int8)."
+
+# ── KV Cache Quantization (combined with weight quant) ──
+
+gptq-4bit-kv8:
+  weight_bits: 4
+  activation_bits: 16
+  memory_factor: 0.28
+  compute_factor: 1.3
+  threshold_factor: 10.0        # KV cache quant adds noise to attn matmuls
+  kv_cache_bits: 8
+  verify_compatible: full
+  notes: "GPTQ 4-bit + INT8 KV cache. Wider threshold for Q@K^T/P@V."
+
+gptq-4bit-kv4:
+  weight_bits: 4
+  activation_bits: 16
+  memory_factor: 0.28
+  compute_factor: 1.3
+  threshold_factor: 20.0
+  kv_cache_bits: 4
+  verify_compatible: partial
+  notes: "GPTQ 4-bit + INT4 KV cache. Significant quant noise in attention."
+
+# ── Diffusion-Specific ──
+
+diffusion-int8:
+  weight_bits: 8
+  activation_bits: 8
+  memory_factor: 0.50
+  compute_factor: 1.6
+  threshold_factor: 5.0
+  kv_cache_bits: 0
+  verify_compatible: full
+  notes: "TensorRT INT8 post-training quantization for diffusion models."
+
+diffusion-fp8:
+  weight_bits: 8
+  activation_bits: 8
+  memory_factor: 0.50
+  compute_factor: 2.0
+  threshold_factor: 2.0
+  kv_cache_bits: 0
+  verify_compatible: full
+  notes: "FP8 diffusion on H100+. Near-lossless."
+
+diffusion-w4:
+  weight_bits: 4
+  activation_bits: 16
+  memory_factor: 0.28
+  compute_factor: 1.2
+  threshold_factor: 5.0
+  kv_cache_bits: 0
+  verify_compatible: full
+  notes: "4-bit weight-only for diffusion (GGUF/SVDQ style)."

@@ -11,6 +11,10 @@ class VerifyConfig:
     # since |S| is effectively continuous. k=10 gives error prob < 2^{-10}.
     freivalds_k: int = 10
     mse_threshold: float = 1e-5
+    # Separate threshold for attention matmuls (Q@K^T, P@V) which accumulate
+    # more rounding error from bf16 chain (norm, RoPE, softmax before matmul).
+    matmul_mse_threshold: float = 0.0  # 0 = use mse_threshold
+    matmul_freivalds_k: int = 0  # 0 = use freivalds_k; set lower for faster attention checks
     verify_every_n: int = 1
     max_workers: int = 2
     fail_on_error: bool = True
@@ -46,6 +50,22 @@ class VerifyConfig:
 
 def default_verify_config(**overrides) -> VerifyConfig:
     cfg = VerifyConfig()
+    for key, value in overrides.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+    return cfg
+
+
+def default_diffusion_config(**overrides) -> VerifyConfig:
+    """Defaults tuned for bf16 diffusion models (relative MSE, more workers)."""
+    cfg = VerifyConfig(
+        mse_threshold=1e-4,            # relative MSE: 1e-4 is ~100x margin over bf16 noise
+        matmul_mse_threshold=1e-3,     # matmul accumulates more error through norm/RoPE chain
+        elementwise_mse_threshold=1e-2,
+        max_workers=12,
+        freivalds_k=4,
+        max_verify_tensor_numel=4_000_000,
+    )
     for key, value in overrides.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)

@@ -1,0 +1,47 @@
+calibration:
+  version: 1
+  timestamp: '2026-04-16T05:47:02.873157'
+  machine:
+    cpu: Intel(R) Xeon(R) CPU @ 2.20GHz
+    cpu_cores: 24
+    gpu: NVIDIA A100-SXM4-80GB
+    gpu_count: 2
+    gpu_memory_gb: 85.0
+    pytorch: 2.10.0+cu128
+  benchmark:
+    model: Tongyi-MAI/Z-Image
+    model_type: diffusion
+    dtype: bf16
+    freivalds_k: 4
+    peak_vram_mb: 32048.0
+    num_steps: 1
+  measured:
+    origin:
+      total_ms: 1536.9
+      per_step_ms: 1536.9
+    verified:
+      total_ms: 13284.82
+      per_step_ms: 13284.82
+      overhead: 8.64
+  profiler:
+    total_checks: 486
+    total_failures: 340
+    pass_rate_pct: 30.0
+    skipped: 2
+    linear_verify:
+      count: 274
+      avg_ms: 9.501
+    matmul_verify:
+      count: 68
+      avg_ms: 74.373
+    elementwise_verify:
+      count: 0
+      avg_ms: 0.0
+    transfer_linear_avg_ms: 0.645
+    transfer_matmul_avg_ms: 0.0
+  factors:
+    gpu_step_ms: 1536.9
+    verified_step_ms: 13284.82
+    linear_verify_ms: 9.501
+    matmul_verify_ms: 74.373
+    transfer_linear_ms: 0.645

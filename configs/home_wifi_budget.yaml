@@ -1,0 +1,27 @@
+# Budget home setup: consumer CPU + 1x 4090 over WiFi-6
+# Worst-case bandwidth scenario
+
+cpu:
+  preset: i9-14900K
+  tee: none        # no TEE on consumer CPU
+
+gpus:
+  - preset: RTX-4090
+    count: 1
+
+network:
+  preset: WiFi-6
+
+models:
+  - preset: Qwen2.5-0.5B
+
+verify:
+  use_slalom: true
+  freivalds_k: 4
+  verify_every_n: 2
+  compression: fp16
+
+inference:
+  batch_size: 1
+  seq_len: 16
+  gen_tokens: 50

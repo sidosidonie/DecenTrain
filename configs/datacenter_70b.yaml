@@ -1,0 +1,26 @@
+# Datacenter: TDX Xeon + 4x H100 pipeline parallel for 70B model
+
+cpu:
+  preset: EPYC-9654
+  tee: sev-snp
+
+gpus:
+  - preset: H100-SXM
+    count: 4
+
+network:
+  preset: 100GbE
+
+models:
+  - preset: Llama-3-70B
+
+verify:
+  use_slalom: true
+  freivalds_k: 10
+  verify_every_n: 1
+  compression: fp16
+
+inference:
+  batch_size: 1
+  seq_len: 64
+  gen_tokens: 100

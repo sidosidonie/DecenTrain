@@ -1,0 +1,26 @@
+# Z-Image diffusion on A100 with TDX verification
+
+cpu:
+  preset: Xeon-8480+
+  tee: tdx
+
+gpus:
+  - preset: A100-80G
+    count: 1
+
+network:
+  preset: 100GbE
+
+models:
+  - preset: Z-Image
+
+verify:
+  use_slalom: true
+  freivalds_k: 10
+  verify_every_n: 1
+  compression: fp16
+
+inference:
+  batch_size: 1
+  num_steps: 4
+  image_size: 512

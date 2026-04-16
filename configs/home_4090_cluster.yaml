@@ -1,0 +1,33 @@
+# Home setup: TDX Xeon + 3x RTX 4090 over 10GbE
+# Each 4090 runs a different model, all verified by one CPU TEE
+
+cpu:
+  preset: Xeon-8480+
+  tee: tdx
+
+gpus:
+  - preset: RTX-4090
+    count: 1
+  - preset: RTX-4090
+    count: 1
+  - preset: RTX-4090
+    count: 1
+
+network:
+  preset: 10GbE
+
+models:
+  - preset: Qwen2.5-0.5B
+  - preset: Llama-3.2-1B
+  - preset: Qwen3.5-9B
+
+verify:
+  use_slalom: true
+  freivalds_k: 10
+  verify_every_n: 1
+  compression: fp16
+
+inference:
+  batch_size: 1
+  seq_len: 32
+  gen_tokens: 50

@@ -1,0 +1,31 @@
+# Mixed workload: LLM + Diffusion on different GPUs -> 1 CPU TEE
+# 4090 #1 runs Qwen3.5-9B (LLM), 4090 #2 runs Z-Image (diffusion)
+
+cpu:
+  preset: Xeon-8480+
+  tee: tdx
+
+gpus:
+  - preset: RTX-4090
+    count: 1
+  - preset: RTX-4090
+    count: 1
+
+network:
+  preset: 25GbE
+
+models:
+  - preset: Qwen3.5-9B
+  - preset: Z-Image
+
+verify:
+  use_slalom: true
+  freivalds_k: 10
+  verify_every_n: 1
+  compression: fp16
+
+inference:
+  batch_size: 1
+  seq_len: 32
+  gen_tokens: 50
+  num_steps: 4

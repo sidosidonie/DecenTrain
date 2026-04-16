@@ -1,0 +1,29 @@
+# Z-Image on A100 — calibrated against real measurements on this machine
+# Origin: 1537ms/step, Verified: 13285ms/step (8.6x overhead)
+
+cpu:
+  type: Xeon-8480+
+  tee: tdx
+
+clusters:
+  - name: "zimage-a100"
+    gpu_type: A100-80G
+    count: 1
+    strategy: standalone
+    model: Z-Image
+
+network:
+  type: 100GbE
+
+verify:
+  use_slalom: true
+  freivalds_k: 10
+  verify_every_n: 1
+  compression: fp16
+
+inference:
+  batch_size: 1
+  num_steps: 4
+
+calibration:
+  - calibration/A100_ZImage.yaml

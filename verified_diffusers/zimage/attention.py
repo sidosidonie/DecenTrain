@@ -152,16 +152,23 @@ class VerifiedZImageAttention(nn.Module):
         prefix = self.tag_prefix
         threshold = rt.config.mse_threshold
         freivalds_k = rt.config.freivalds_k
+        matmul_k = rt.config.matmul_freivalds_k or freivalds_k
         profiler = rt.profiler
         errors = rt._errors
 
         _gpu_refs = [hidden_states, q_raw, k_raw, v_raw, scores, attn_out_flat, o_raw]
 
-        def _chain():
-            for evt in [x_e, q_e, k_e, v_e, sc_e, ao_e, o_e]:
+        matmul_threshold = rt.config.matmul_mse_threshold or threshold
+
+        # Split into two tasks: (1) linear SLALOM checks (fast), (2) matmul
+        # Freivalds + non-linear chain (slow). This lets the thread pool
+        # overlap SLALOM work from one layer with Freivalds from another.
+
+        def _linear_checks():
+            """Verify Q/K/V/O projections via SLALOM (fast, O(n*k))."""
+            for evt in [x_e, q_e, k_e, v_e, ao_e, o_e]:
                 if evt is not None:
                     evt.synchronize()
-            _gpu_refs.clear()
 
             x = x_h.float()
 
@@ -174,26 +181,31 @@ class VerifiedZImageAttention(nn.Module):
                     errors.append(f"{tag} SLALOM failed: loss={loss:.6e}")
                 profiler.add("verify", "linear_slalom", dt, tag=tag, ok=ok, extra=f"loss={loss:.6e}")
 
+            _slalom(f"{prefix}.to_q", x, q_h.float(), tq_s, tq_st)
+            _slalom(f"{prefix}.to_k", x, k_h.float(), tk_s, tk_st)
+            _slalom(f"{prefix}.to_v", x, v_h.float(), tv_s, tv_st)
+            _slalom(f"{prefix}.to_out", ao_h.float(), o_h.float(), to_s, to_st)
+
+        def _matmul_chain():
+            """Verify Q@K^T and P@V via Freivalds + non-linear recompute (slow)."""
+            for evt in [q_e, k_e, v_e, sc_e, ao_e]:
+                if evt is not None:
+                    evt.synchronize()
+            _gpu_refs.clear()
+
             def _freivalds(tag, A, B, C):
                 t0 = time.perf_counter()
-                loss = freivalds_batch_matmul(A, B, C, k=freivalds_k)
+                loss = freivalds_batch_matmul(A, B, C, k=matmul_k)
                 dt = (time.perf_counter() - t0) * 1000
-                ok = loss <= threshold
+                ok = loss <= matmul_threshold
                 if not ok:
                     errors.append(f"{tag} Freivalds failed: loss={loss:.6e}")
                 profiler.add("verify", "matmul_freivalds", dt, tag=tag, ok=ok, extra=f"loss={loss:.6e}")
 
-            # 1. Verify Q/K/V projections
-            _slalom(f"{prefix}.to_q", x, q_h.float(), tq_s, tq_st)
-            _slalom(f"{prefix}.to_k", x, k_h.float(), tk_s, tk_st)
-            _slalom(f"{prefix}.to_v", x, v_h.float(), tv_s, tv_st)
-
-            # 2. CPU chain: reshape + norm + RoPE
             q_cpu = q_h.float().unflatten(-1, (heads, -1))
             k_cpu = k_h.float().unflatten(-1, (heads, -1))
             v_cpu = v_h.float().unflatten(-1, (heads, -1))
 
-            # Diffusers RMSNorm: x * rsqrt(mean(x^2) + eps) * weight
             if nqw is not None or nqe is not None:
                 q_f = q_cpu.float()
                 q_cpu = q_f * torch.rsqrt(q_f.pow(2).mean(-1, keepdim=True) + nqe)
@@ -214,25 +226,17 @@ class VerifiedZImageAttention(nn.Module):
             v_t = v_cpu.permute(0, 2, 1, 3)
             head_dim = q_cpu.shape[-1]
 
-            # 3. Verify Q@K^T
             _freivalds(f"{prefix}.qk", q_t, k_t.transpose(2, 3), sc_h.float())
 
-            # 4. CPU softmax
             sc_cpu = sc_h.float() * (head_dim ** -0.5)
             if mask_cpu is not None:
                 sc_cpu = sc_cpu + mask_cpu
             probs_cpu = F.softmax(sc_cpu, dim=-1, dtype=torch.float32)
 
-            # 5. Verify P@V
             _freivalds(f"{prefix}.kv", probs_cpu, v_t, ao_h.float().unflatten(-1, (heads, -1)).permute(0, 2, 1, 3))
-
-            # 6. CPU chain → input for O projection
-            ao_flat = ao_h.float()
-
-            # 7. Verify O projection
-            _slalom(f"{prefix}.to_out", ao_flat, o_h.float(), to_s, to_st)
 
             profiler.add("verify", "cpu_chain_nonlinear", 0.0, tag=prefix, ok=True,
                          extra="norm_q,norm_k,rope,softmax")
 
-        rt._enqueue(_chain)
+        rt._enqueue(_linear_checks)
+        rt._enqueue(_matmul_chain)

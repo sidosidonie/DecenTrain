@@ -45,6 +45,7 @@ def slalom_precompute(
     weight_t: torch.Tensor,
     k: int = 10,
     s_range: int = 1,
+    gpu_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Precompute SLALOM verification vectors for a linear layer.
 
@@ -52,15 +53,16 @@ def slalom_precompute(
     fixed W, precompute s_tilde = W^T @ s offline. Online verification
     becomes y @ s == x @ s_tilde at O(n*k) cost.
 
-    The original paper uses large integer random vectors (|S| = 2^20) with
-    quantized integer arithmetic in a finite field. For floating-point
-    inference, we use unit-scale Gaussian random vectors to avoid amplifying
-    fp32 rounding errors (floating-point matmul is not associative).
+    The precomputation simulates the GPU's precision path: W is first cast
+    to the GPU dtype (e.g. bf16) then back to float32, so s_tilde matches
+    the rounding the GPU actually applies to the weights.
 
     Args:
         weight_t: Transposed weight matrix W^T, shape [in_features, out_features].
         k: Number of random vectors (repetitions).
         s_range: Unused in Gaussian mode; retained for API compatibility.
+        gpu_dtype: The dtype used on GPU (bf16/fp16/fp32). The precomputation
+            round-trips weights through this dtype to match GPU rounding.
 
     Returns:
         (s, s_tilde) where:
@@ -68,15 +70,15 @@ def slalom_precompute(
           s_tilde: Preprocessed W^T @ s, shape [in_features, k]
     """
     out_features = weight_t.shape[1]
-    # Gaussian random vectors (unit scale) for floating-point compatibility.
-    # The paper's integer vectors require exact field arithmetic; Gaussian
-    # vectors with MSE threshold provide equivalent probabilistic guarantees
-    # in the floating-point setting.
     s = torch.randn(out_features, k, dtype=torch.float32)
-    # Precompute s_tilde = W^T @ s in float64 for maximum precision.
-    # This is an offline cost; double precision eliminates precomputation
-    # rounding error so the online check only reflects GPU computation error.
-    s_tilde = torch.matmul(weight_t.double(), s.double()).float()
+    # Round-trip weights through GPU dtype to match GPU rounding behavior.
+    # Without this, bf16 inference produces y with bf16-rounded W, but
+    # s_tilde uses float64 W — the mismatch causes massive false positives.
+    if gpu_dtype in (torch.bfloat16, torch.float16):
+        w_sim = weight_t.to(gpu_dtype).float()
+    else:
+        w_sim = weight_t.float()
+    s_tilde = torch.matmul(w_sim.double(), s.double()).float()
     return s, s_tilde
 
 
@@ -89,20 +91,19 @@ def slalom_verify_preprocessed(
     """Verify y = x @ W^T using SLALOM preprocessed Freivalds check.
 
     Online cost: O(batch * seq * (in + out) * k) -- two matrix-vector products.
-    Compare with standard Freivalds: O(in * out * k + batch * seq * (in + out) * k).
 
-    Args:
-        x: Input tensor, shape [..., in_features], float32
-        y: Output tensor, shape [..., out_features], float32
-        s: Random vector, shape [out_features, k]
-        s_tilde: Preprocessed vector W^T @ s, shape [in_features, k]
+    Uses relative MSE (normalized by signal magnitude) to handle bf16/fp16
+    models where absolute values in the projections can be large. This makes
+    the threshold independent of tensor scale.
 
     Returns:
-        MSE between y @ s and x @ s_tilde.
+        Relative MSE: mean((y@s - x@s_tilde)^2) / (mean((y@s)^2) + eps).
     """
     y_s = torch.matmul(y, s)          # [..., k]
     x_st = torch.matmul(x, s_tilde)  # [..., k]
-    return F.mse_loss(y_s, x_st).item()
+    diff_sq = (y_s - x_st).pow(2).mean()
+    signal_sq = y_s.pow(2).mean().clamp(min=1e-10)
+    return (diff_sq / signal_sq).item()
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +125,7 @@ def freivalds_batch_matmul_bias(
     A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
     bias: torch.Tensor | None, k: int = 10,
 ) -> float:
-    """Verify C = A @ B + bias (batched, any dim >= 2)."""
+    """Verify C = A @ B + bias (batched). Returns relative MSE."""
     assert A.device == B.device == C.device
     r = _rand_vec_cache.get(C.shape[-1], k, A.dtype)
     Br = torch.matmul(B, r)
@@ -133,14 +134,16 @@ def freivalds_batch_matmul_bias(
         bias_r = torch.matmul(bias.unsqueeze(-2), r)
         ABr = ABr + bias_r.expand_as(ABr)
     Cr = torch.matmul(C, r)
-    return F.mse_loss(ABr, Cr).item()
+    diff_sq = (ABr - Cr).pow(2).mean()
+    signal_sq = Cr.pow(2).mean().clamp(min=1e-10)
+    return (diff_sq / signal_sq).item()
 
 
 def freivalds_algorithm_2d_bias(
     A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
     bias: torch.Tensor | None = None, k: int = 10,
 ) -> float:
-    """Verify C = A @ B + bias (2D matrices)."""
+    """Verify C = A @ B + bias (2D). Returns relative MSE."""
     assert A.device == B.device == C.device
     r = _rand_vec_cache.get(C.shape[-1], k, A.dtype)
     Br = torch.mm(B, r)
@@ -149,21 +152,25 @@ def freivalds_algorithm_2d_bias(
         bias_r = torch.mm(bias.view(1, -1), r)
         ABr = ABr + bias_r.expand(ABr.shape)
     Cr = torch.mm(C, r)
-    return F.mse_loss(ABr, Cr).item()
+    diff_sq = (ABr - Cr).pow(2).mean()
+    signal_sq = Cr.pow(2).mean().clamp(min=1e-10)
+    return (diff_sq / signal_sq).item()
 
 
 def freivalds_batch_matmul(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10) -> float:
-    """Verify C = A @ B (batched, no bias)."""
+    """Verify C = A @ B (batched, no bias). Returns relative MSE."""
     assert A.device == B.device == C.device
     r = _rand_vec_cache.get(C.shape[-1], k, A.dtype)
     Br = torch.matmul(B, r)
     ABr = torch.matmul(A, Br)
     Cr = torch.matmul(C, r)
-    return F.mse_loss(ABr, Cr).item()
+    diff_sq = (ABr - Cr).pow(2).mean()
+    signal_sq = Cr.pow(2).mean().clamp(min=1e-10)
+    return (diff_sq / signal_sq).item()
 
 
 def freivalds_batch_matmul_parallel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10) -> float:
-    """Verify C = A @ B with A@Br and C@r computed in parallel."""
+    """Verify C = A @ B with A@Br and C@r computed in parallel. Returns relative MSE."""
     assert A.device == B.device == C.device
     r = _rand_vec_cache.get(C.shape[-1], k, A.dtype)
     Br = torch.matmul(B, r)
@@ -174,17 +181,21 @@ def freivalds_batch_matmul_parallel(A: torch.Tensor, B: torch.Tensor, C: torch.T
         ABr = f_ABr.result()
         Cr = f_Cr.result()
 
-    return F.mse_loss(ABr, Cr).item()
+    diff_sq = (ABr - Cr).pow(2).mean()
+    signal_sq = Cr.pow(2).mean().clamp(min=1e-10)
+    return (diff_sq / signal_sq).item()
 
 
 def freivalds_algorithm_2d(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10) -> float:
-    """Verify C = A @ B (2D matrices, no bias)."""
+    """Verify C = A @ B (2D). Returns relative MSE."""
     assert A.device == B.device == C.device
     r = _rand_vec_cache.get(C.shape[-1], k, A.dtype)
     Br = torch.mm(B, r)
     ABr = torch.mm(A, Br)
     Cr = torch.mm(C, r)
-    return F.mse_loss(ABr, Cr).item()
+    diff_sq = (ABr - Cr).pow(2).mean()
+    signal_sq = Cr.pow(2).mean().clamp(min=1e-10)
+    return (diff_sq / signal_sq).item()
 
 
 def freivalds_algorithm_bias(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, bias: torch.Tensor | None, k: int = 10) -> float:
@@ -260,6 +271,7 @@ class VerifyLinear:
             linear.weight.detach().t().float().to("cpu"),
             k=cfg.freivalds_k,
             s_range=cfg.slalom_s_range,
+            gpu_dtype=linear.weight.dtype,
         )
 
         # Bias on CPU for chain verification.

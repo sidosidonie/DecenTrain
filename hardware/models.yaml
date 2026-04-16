@@ -1,0 +1,155 @@
+# Model Definitions
+# Reference by name in system configs: model: Qwen3.5-9B
+
+# ═══════════════════════════════════════
+# LLM Models
+# ═══════════════════════════════════════
+
+Qwen2.5-0.5B:
+  type: llm
+  hidden_size: 896
+  intermediate_size: 4864
+  num_layers: 24
+  num_attention_heads: 14
+  num_kv_heads: 2
+  head_dim: 64
+  num_verified_attn_layers: 24
+  num_verified_mlp_layers: 24
+  param_bytes: 1e9
+
+Llama-3.2-1B:
+  type: llm
+  hidden_size: 2048
+  intermediate_size: 8192
+  num_layers: 16
+  num_attention_heads: 32
+  num_kv_heads: 8
+  head_dim: 64
+  num_verified_attn_layers: 16
+  num_verified_mlp_layers: 16
+  param_bytes: 2e9
+
+Llama-3.2-3B:
+  type: llm
+  hidden_size: 3072
+  intermediate_size: 8192
+  num_layers: 28
+  num_attention_heads: 24
+  num_kv_heads: 8
+  head_dim: 128
+  num_verified_attn_layers: 28
+  num_verified_mlp_layers: 28
+  param_bytes: 6e9
+
+Qwen2.5-7B:
+  type: llm
+  hidden_size: 3584
+  intermediate_size: 18944
+  num_layers: 28
+  num_attention_heads: 28
+  num_kv_heads: 4
+  head_dim: 128
+  num_verified_attn_layers: 28
+  num_verified_mlp_layers: 28
+  param_bytes: 14e9
+
+Qwen3.5-9B:
+  type: llm
+  hidden_size: 4096
+  intermediate_size: 12288
+  num_layers: 32
+  num_attention_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  # Hybrid: 8 full_attention (verified) + 24 linear_attention (pass-through)
+  num_verified_attn_layers: 8
+  num_verified_mlp_layers: 32
+  param_bytes: 18e9
+
+Llama-3-8B:
+  type: llm
+  hidden_size: 4096
+  intermediate_size: 14336
+  num_layers: 32
+  num_attention_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  num_verified_attn_layers: 32
+  num_verified_mlp_layers: 32
+  param_bytes: 16e9
+
+Llama-3-70B:
+  type: llm
+  hidden_size: 8192
+  intermediate_size: 28672
+  num_layers: 80
+  num_attention_heads: 64
+  num_kv_heads: 8
+  head_dim: 128
+  num_verified_attn_layers: 80
+  num_verified_mlp_layers: 80
+  param_bytes: 140e9
+
+Qwen2.5-72B:
+  type: llm
+  hidden_size: 8192
+  intermediate_size: 29568
+  num_layers: 80
+  num_attention_heads: 64
+  num_kv_heads: 8
+  head_dim: 128
+  num_verified_attn_layers: 80
+  num_verified_mlp_layers: 80
+  param_bytes: 144e9
+
+# ═══════════════════════════════════════
+# Diffusion Models
+# ═══════════════════════════════════════
+
+Z-Image:
+  type: diffusion
+  hidden_size: 3840
+  intermediate_size: 10240
+  num_layers: 30
+  num_attention_heads: 30
+  num_kv_heads: 30
+  head_dim: 128
+  num_verified_attn_layers: 30
+  num_verified_mlp_layers: 30
+  param_bytes: 4e9
+  num_refiner_layers: 2
+  default_steps: 4
+  default_image_size: 512
+  latent_seq_len: 1024
+
+SDXL:
+  type: diffusion
+  hidden_size: 2048
+  intermediate_size: 8192
+  num_layers: 10
+  num_attention_heads: 20
+  num_kv_heads: 20
+  head_dim: 64
+  num_verified_attn_layers: 10
+  num_verified_mlp_layers: 10
+  param_bytes: 6.6e9
+  num_refiner_layers: 0
+  default_steps: 30
+  default_image_size: 1024
+  latent_seq_len: 4096
+
+Flux-dev:
+  type: diffusion
+  hidden_size: 3072
+  intermediate_size: 8192
+  num_layers: 19
+  num_attention_heads: 24
+  num_kv_heads: 24
+  head_dim: 128
+  num_verified_attn_layers: 19
+  num_verified_mlp_layers: 19
+  param_bytes: 24e9
+  num_refiner_layers: 38
+  default_steps: 20
+  default_image_size: 1024
+  latent_seq_len: 4096

@@ -1,0 +1,36 @@
+# FP8 quantized 70B on H100 — native FP8 tensor core support
+# 2x throughput with near-lossless quality
+
+cpu:
+  type: EPYC-9654
+  tee: sev-snp
+
+clusters:
+  - name: "70b-fp8"
+    gpu_type: H100-SXM
+    count: 2
+    strategy: tensor_parallel
+    model: Llama-3-70B
+    quantization: fp8-e4m3          # 140GB -> 70GB, 2x compute speedup
+
+  - name: "diffusion-int8"
+    gpu_type: H100-SXM
+    count: 1
+    strategy: standalone
+    model: Z-Image
+    quantization: diffusion-int8
+
+network:
+  type: 100GbE
+
+verify:
+  use_slalom: true
+  freivalds_k: 10
+  verify_every_n: 1
+  compression: fp16
+
+inference:
+  batch_size: 1
+  seq_len: 64
+  gen_tokens: 100
+  num_steps: 4

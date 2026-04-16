@@ -1,0 +1,54 @@
+# Network Hardware Definitions
+# Reference by name in system configs: network_type: 10GbE
+
+# ── Home / Consumer ──
+
+1GbE:
+  bandwidth_gbps: 1
+  latency_us: 500
+
+2.5GbE:
+  bandwidth_gbps: 2.5
+  latency_us: 300
+
+WiFi-6:
+  bandwidth_gbps: 1.2           # realistic throughput
+  latency_us: 2000
+
+WiFi-7:
+  bandwidth_gbps: 3
+  latency_us: 1000
+
+# ── Prosumer / Small Cluster ──
+
+10GbE:
+  bandwidth_gbps: 10
+  latency_us: 100
+
+25GbE:
+  bandwidth_gbps: 25
+  latency_us: 50
+
+# ── Datacenter ──
+
+100GbE:
+  bandwidth_gbps: 100
+  latency_us: 10
+
+200GbE-IB:
+  bandwidth_gbps: 200
+  latency_us: 2                 # InfiniBand HDR
+
+400GbE-IB:
+  bandwidth_gbps: 400
+  latency_us: 1                 # InfiniBand NDR
+
+# ── Local (same machine) ──
+
+local-PCIe4:
+  bandwidth_gbps: 256           # PCIe 4.0 x16
+  latency_us: 0
+
+local-PCIe5:
+  bandwidth_gbps: 512           # PCIe 5.0 x16
+  latency_us: 0

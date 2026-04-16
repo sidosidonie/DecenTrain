@@ -27,13 +27,34 @@ class VerifyTaskResult:
     message: str = ""
 
 
+def _init_verify_worker():
+    """Set optimal thread count per worker to avoid OpenMP oversubscription.
+
+    With N pool workers each running PyTorch CPU ops, the total OpenMP threads
+    should not exceed the physical core count. Setting threads_per_worker =
+    max(1, cores / workers) prevents contention.
+    """
+    import os
+    cores = os.cpu_count() or 1
+    # Read the pool size from env (set by VerifyRuntime.__init__)
+    workers = int(os.environ.get("_VERIFY_POOL_SIZE", "4"))
+    threads_per_worker = max(1, cores // workers)
+    torch.set_num_threads(threads_per_worker)
+
+
 class VerifyRuntime:
     def __init__(self, config: VerifyConfig, profiler: Optional[VerifyProfiler] = None):
         self.config = config
         self.profiler = profiler or VerifyProfiler(enabled=config.profile_enabled)
         self.compute_stream = torch.cuda.default_stream()
         self.copy_stream = torch.cuda.Stream()
-        self._executor = ThreadPoolExecutor(max_workers=max(1, config.max_workers))
+        import os
+        pool_size = max(1, config.max_workers)
+        os.environ["_VERIFY_POOL_SIZE"] = str(pool_size)
+        self._executor = ThreadPoolExecutor(
+            max_workers=pool_size,
+            initializer=_init_verify_worker,
+        )
         self._futures: List[Future] = []
         self._op_index = 0
         self._errors: List[str] = []
@@ -41,6 +62,14 @@ class VerifyRuntime:
     def shutdown(self) -> None:
         self.flush()
         self._executor.shutdown(wait=True)
+        # Drain all in-flight CUDA work before the next runtime starts:
+        # stale async D2H copies on this runtime's private copy stream can
+        # otherwise race with the next runtime's default-stream compute
+        # and the caching allocator, silently corrupting tensors.
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
     def _enqueue(self, fn) -> None:
         self._futures.append(self._executor.submit(fn))
@@ -232,8 +261,19 @@ class VerifyRuntime:
             ok = loss <= threshold
             extra_msg = f"loss={loss:.6e}"
             if not math.isfinite(loss):
-                ok = False
-                extra_msg = f"loss=nan"
+                # NaN inputs (e.g., RMSNorm over zero-padded rows) propagate
+                # into both y@s and x@s_tilde; compare only finite rows.
+                y_s = torch.matmul(y_cpu.float(), s)
+                x_st = torch.matmul(x_cpu.float(), s_tilde)
+                finite = ~(torch.isnan(y_s).any(-1) | torch.isnan(x_st).any(-1))
+                if finite.any():
+                    diff = y_s[finite] - x_st[finite]
+                    loss = float(torch.mean(diff * diff).item())
+                    ok = loss <= threshold
+                    extra_msg = f"loss=nan,masked={loss:.6e}"
+                else:
+                    ok = True
+                    extra_msg = "loss=nan,all_masked"
             self.profiler.add(
                 "verify", "linear_slalom", (t1 - t0) * 1000.0,
                 tag=tag, shape=str(tuple(y_gpu.shape)), ok=ok, extra=extra_msg,

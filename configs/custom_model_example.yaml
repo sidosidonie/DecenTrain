@@ -1,0 +1,72 @@
+# Example: custom model with manually specified architecture
+# You can mix presets and custom fields — preset fills defaults,
+# then your overrides take precedence.
+
+cpu:
+  # Use a preset and override the TEE type
+  preset: EPYC-9654
+  tee: sev-snp
+
+  # Or specify everything manually:
+  # name: "My Custom CPU"
+  # cores: 64
+  # fp32_gflops: 2000
+  # memory_bw_gbps: 300
+  # tee: tdx
+
+gpus:
+  - preset: RTX-4090
+    count: 2          # 2x 4090 in pipeline parallel
+
+network:
+  # Use preset
+  preset: 10GbE
+
+  # Or manual:
+  # name: "My Network"
+  # bandwidth_gbps: 5.0
+  # latency_us: 200
+
+models:
+  # Custom LLM model
+  - name: "MyCustom-13B"
+    type: llm
+    hidden_size: 5120
+    intermediate_size: 13824
+    num_layers: 40
+    num_attention_heads: 40
+    num_kv_heads: 8
+    head_dim: 128
+    num_verified_attn_layers: 40   # verify all attention layers
+    num_verified_mlp_layers: 40    # verify all MLP layers
+    param_bytes: 26e9              # 13B params x 2 bytes (bf16)
+
+  # Custom diffusion model
+  # - name: "MyDiffusion"
+  #   type: diffusion
+  #   hidden_size: 2048
+  #   intermediate_size: 8192
+  #   num_layers: 24
+  #   num_attention_heads: 16
+  #   num_kv_heads: 16
+  #   head_dim: 128
+  #   num_verified_attn_layers: 24
+  #   num_verified_mlp_layers: 24
+  #   param_bytes: 3e9
+  #   num_refiner_layers: 0
+  #   default_steps: 20
+  #   latent_seq_len: 4096
+
+verify:
+  use_slalom: true       # true = SLALOM (planned), false = standard Freivalds (current)
+  freivalds_k: 10        # random vectors (confidence: 1 - 2^{-k})
+  verify_every_n: 1      # verify every Nth operation (1 = all)
+  max_workers: 0         # 0 = auto (use all CPU cores)
+  compression: fp16      # "none" or "fp16" (halves transfer size)
+
+inference:
+  batch_size: 1
+  seq_len: 32            # prompt length (LLM prefill)
+  gen_tokens: 50         # tokens to generate (LLM decode)
+  num_steps: 0           # diffusion steps (0 = model default)
+  image_size: 0          # diffusion image size (0 = model default)

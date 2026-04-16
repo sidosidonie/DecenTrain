@@ -29,12 +29,13 @@ class VerifyLinearModule(nn.Module):
         self.runtime = runtime
         self.tag = tag
 
-        # SLALOM preprocessing
+        # SLALOM preprocessing — round-trip through GPU dtype to match rounding
         cfg = runtime.config
         self.s, self.s_tilde = slalom_precompute(
             linear.weight.detach().t().float().to("cpu"),
             k=cfg.freivalds_k,
             s_range=cfg.slalom_s_range,
+            gpu_dtype=linear.weight.dtype,
         )
         self.bias_cpu = linear.bias.detach().float().to("cpu") if linear.bias is not None else None
 
