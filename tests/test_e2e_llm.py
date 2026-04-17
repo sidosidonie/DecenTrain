@@ -24,8 +24,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from verified_diffusers.zimage.config import VerifyConfig
-from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_core.config import VerifyConfig
+from verified_core.runtime import VerifyRuntime
 from verified_llm.llm_model import create_llm_model
 
 pytestmark = [
@@ -212,7 +212,7 @@ def test_e2e_llm_corruption_detected():
     # VerifyLinear is a plain class (not nn.Module), stored as attributes on
     # LlamaMLPVerify / LlamaAttentionVerify modules. Walk all modules and
     # inspect their __dict__ for VerifyLinear instances.
-    from verified_llm.verify_linear import VerifyLinear
+    from verified_core.verify_linear import VerifyLinear
 
     corrupted_tags = []
     for _name, module in model.named_modules():

@@ -9,9 +9,9 @@ from diffusers.models.transformers.transformer_z_image import FeedForward, ZSing
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from verified_diffusers.zimage.attention import VerifiedZImageAttention
-from verified_diffusers.zimage.config import VerifyConfig
+from verified_core.config import VerifyConfig
 from verified_diffusers.zimage.mlp import VerifiedZImageFeedForward
-from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_core.runtime import VerifyRuntime
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

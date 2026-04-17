@@ -1,4 +1,4 @@
-from verified_diffusers.zimage.config import VerifyConfig, default_verify_config
+from verified_core.config import VerifyConfig, default_verify_config
 
 try:
     from verified_diffusers.zimage.pipeline import (

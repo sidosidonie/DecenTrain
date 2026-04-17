@@ -6,9 +6,9 @@ from typing import Any, Dict, Optional
 import torch
 from diffusers import DiffusionPipeline
 
-from verified_diffusers.zimage.config import VerifyConfig, default_verify_config
-from verified_diffusers.zimage.profiler import VerifyProfiler
-from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_core.config import VerifyConfig, default_verify_config
+from verified_core.profiler import VerifyProfiler
+from verified_core.runtime import VerifyRuntime
 from verified_diffusers.zimage.transformer import VerifiedZImageTransformer2DModel
 
 

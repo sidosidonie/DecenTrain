@@ -16,8 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from verified_diffusers.zimage.runtime import VerifyRuntime
-from verified_llm.verify_linear import slalom_precompute, slalom_verify_preprocessed
+from verified_core.runtime import VerifyRuntime
+from verified_core.verify_linear import slalom_precompute, slalom_verify_preprocessed
 
 
 class VerifyLinearModule(nn.Module):

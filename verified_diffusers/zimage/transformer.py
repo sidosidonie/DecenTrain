@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from verified_diffusers.zimage.layers import VerifyLinearModule
-from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_core.runtime import VerifyRuntime
 from verified_diffusers.zimage.transformer_block import VerifiedZImageTransformerBlock
 
 

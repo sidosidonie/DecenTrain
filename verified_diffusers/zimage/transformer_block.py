@@ -15,7 +15,7 @@ except ImportError:
 from verified_diffusers.zimage.attention import VerifiedZImageAttention
 from verified_diffusers.zimage.layers import VerifyLinearModule
 from verified_diffusers.zimage.mlp import VerifiedZImageFeedForward
-from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_core.runtime import VerifyRuntime
 
 
 class VerifiedZImageTransformerBlock(nn.Module):

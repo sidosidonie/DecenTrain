@@ -153,7 +153,7 @@ def run_llm_benchmark(
     timed_runs: int = 3, **kwargs,
 ) -> BenchResult:
     from transformers import AutoTokenizer
-    from verified_diffusers.zimage.config import VerifyConfig
+    from verified_core.config import VerifyConfig
     from verified_llm.llm_model import create_llm_model
 
     dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16 if dtype_str == "fp16" else torch.float32
@@ -289,7 +289,7 @@ def run_diffusion_benchmark(
     timed_runs: int = 1, **kwargs,
 ) -> BenchResult:
     from diffusers import DiffusionPipeline
-    from verified_diffusers.zimage.config import VerifyConfig
+    from verified_core.config import VerifyConfig
     from verified_diffusers.zimage.pipeline import patch_zimage_pipeline
 
     dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16 if dtype_str == "fp16" else torch.float32

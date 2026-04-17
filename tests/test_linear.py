@@ -2,9 +2,9 @@ import torch
 from torch.nn import Linear
 from pytest import mark
 
-from verified_diffusers.zimage.config import VerifyConfig
-from verified_diffusers.zimage.runtime import VerifyRuntime
-from verified_llm.verify_linear import VerifyLinear, copy_to_cpu, freivalds_batch_matmul
+from verified_core.config import VerifyConfig
+from verified_core.runtime import VerifyRuntime
+from verified_core.verify_linear import VerifyLinear, copy_to_cpu, freivalds_batch_matmul
 
 
 @mark.parametrize("batch, hidden, inter, bias", [

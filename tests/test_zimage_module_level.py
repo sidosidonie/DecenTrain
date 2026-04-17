@@ -23,9 +23,9 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from verified_diffusers.zimage.config import VerifyConfig
+from verified_core.config import VerifyConfig
 from verified_diffusers.zimage.layers import VerifyLinearModule, VerifyMatmul
-from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_core.runtime import VerifyRuntime
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"

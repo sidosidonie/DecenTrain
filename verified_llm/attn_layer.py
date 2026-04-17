@@ -2,13 +2,22 @@
 Verified attention layer with CPU verification chain.
 
 GPU runs the complete forward pass (all matmuls + non-linears).
-CPU asynchronously verifies:
-  - Linear projections via SLALOM preprocessed Freivalds (D2H output only)
-  - Q@K^T and P@V via standard Freivalds (D2H output only, inputs from CPU chain)
-  - Non-linears (q_norm, RoPE, softmax, sigmoid) recomputed on CPU from chain data
+CPU asynchronously verifies — only matmul OUTPUTS are D2H copied.
+All inputs come from the CPU chain (maintained across layers via runtime
+cpu_state).  Non-linear operations (layernorm, q_norm, RoPE, softmax,
+sigmoid) are recomputed on CPU from chain data.
 
-Only matmul outputs are D2H'd. Non-linear results are computed on CPU from
-already-verified data, so they are trusted by construction.
+Data flow per layer:
+  cpu_state['layer_input_{idx}'] ──► input_layernorm (CPU)
+    ──► verify Q/K/V outputs (D2H) via SLALOM
+    ──► bias + reshape + q/k_norm + RoPE (CPU)
+    ──► verify Q@K^T output (D2H) via Freivalds
+    ──► softmax (CPU)
+    ──► verify P@V output (D2H) via Freivalds
+    ──► reshape + gate + sigmoid (CPU)
+    ──► verify O output (D2H) via SLALOM
+    ──► residual (CPU)
+    ──► cpu_state['post_attn_{idx}']
 """
 from __future__ import annotations
 
@@ -42,8 +51,8 @@ assert apply_rotary_pos_emb is not None, (
     "Could not import apply_rotary_pos_emb from any supported model module"
 )
 
-from verified_diffusers.zimage.runtime import VerifyRuntime
-from verified_llm.verify_linear import (
+from verified_core.runtime import VerifyRuntime
+from verified_core.verify_linear import (
     VerifyLinear,
     freivalds_batch_matmul,
     slalom_verify_preprocessed,
@@ -69,9 +78,10 @@ def _rms_norm_cpu(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
 class LlamaAttentionVerify(nn.Module):
     """Verified attention with CPU verification chain.
 
-    GPU runs the complete forward pass. CPU asynchronously verifies every
-    matmul output and recomputes every non-linear operation from the
-    verified chain data. Only matmul outputs are D2H copied.
+    GPU runs the complete forward pass.  CPU asynchronously verifies every
+    matmul output; non-linear results are computed on CPU from already-
+    verified chain data.  Only matmul outputs are D2H copied — the input
+    comes from the CPU chain state maintained by the runtime.
     """
 
     def __init__(
@@ -80,6 +90,10 @@ class LlamaAttentionVerify(nn.Module):
         runtime: VerifyRuntime,
         tag_prefix: str = "",
         noise=None,
+        *,
+        layer_idx: int = 0,
+        input_ln_weight: Optional[torch.Tensor] = None,
+        input_ln_eps: float = 1e-6,
     ):
         super().__init__()
         self.config = origin.config
@@ -113,6 +127,11 @@ class LlamaAttentionVerify(nn.Module):
         self.v_proj = VerifyLinear(origin.v_proj, runtime, f"{prefix}.v", noise)
         self.o_proj = VerifyLinear(origin.o_proj, runtime, f"{prefix}.o", noise)
         self.runtime = runtime
+
+        # CPU chain: layer index and input-layernorm weights
+        self._chain_layer_idx = layer_idx
+        self._input_ln_weight = input_ln_weight   # float32, CPU
+        self._input_ln_eps = input_ln_eps
 
     def forward(
         self,
@@ -158,7 +177,6 @@ class LlamaAttentionVerify(nn.Module):
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         # KV cache — track whether cache had previous entries for this layer
-        # (affects whether CPU chain can verify Q@K^T / P@V)
         cache_had_previous = (
             cache is not None
             and hasattr(cache, "get_seq_length")
@@ -199,7 +217,7 @@ class LlamaAttentionVerify(nn.Module):
 
         if self.runtime.config.enabled:
             self._submit_chain(
-                hidden_states, q_raw, k_raw, v_raw,
+                q_raw, k_raw, v_raw,
                 scores, attn_out, o_raw,
                 cos, sin, attention_mask,
                 cache_had_previous,
@@ -207,18 +225,19 @@ class LlamaAttentionVerify(nn.Module):
 
         return output, attn_probs
 
+    # ------------------------------------------------------------------
+    # CPU verification chain — only matmul OUTPUTS are D2H copied
+    # ------------------------------------------------------------------
+
     def _submit_chain(
-        self, hidden_states, q_raw, k_raw, v_raw,
+        self, q_raw, k_raw, v_raw,
         scores, attn_out, o_raw,
         cos, sin, attention_mask, has_cache,
     ):
         rt = self.runtime
-        if not rt.should_verify_now():
-            return
 
-        # D2H copies — only matmul outputs + shared input
+        # D2H copies — ONLY matmul outputs (no input D2H!)
         d2h = rt.d2h_async
-        x_h, x_e = d2h(hidden_states)
         q_h, q_e = d2h(q_raw)
         k_h, k_e = d2h(k_raw)
         v_h, v_e = d2h(v_raw)
@@ -235,10 +254,12 @@ class LlamaAttentionVerify(nn.Module):
         q_s, q_st, q_bias = self.q_proj.s, self.q_proj.s_tilde, self.q_proj.bias_cpu
         k_s, k_st, k_bias = self.k_proj.s, self.k_proj.s_tilde, self.k_proj.bias_cpu
         v_s, v_st, v_bias = self.v_proj.s, self.v_proj.s_tilde, self.v_proj.bias_cpu
-        o_s, o_st = self.o_proj.s, self.o_proj.s_tilde
+        o_s, o_st, o_bias = self.o_proj.s, self.o_proj.s_tilde, self.o_proj.bias_cpu
         q_nw, q_ne = self.q_norm_w, self.q_norm_eps
         k_nw, k_ne = self.k_norm_w, self.k_norm_eps
-        layer_idx = self.layer_idx
+        layer_idx = self._chain_layer_idx
+        input_ln_w = self._input_ln_weight
+        input_ln_eps = self._input_ln_eps
         head_dim = self.head_dim
         num_kv_groups = self.num_key_value_groups
         scaling = self.scaling
@@ -249,17 +270,23 @@ class LlamaAttentionVerify(nn.Module):
         errors = rt._errors
 
         # Keep GPU refs alive until D2H completes
-        _gpu_refs = [hidden_states, q_raw, k_raw, v_raw, scores, attn_out, o_raw]
+        _gpu_refs = [q_raw, k_raw, v_raw, scores, attn_out, o_raw]
 
         def _chain():
-            # Wait for all D2H
-            for evt in [x_e, q_e, k_e, v_e, sc_e, ao_e, o_e]:
+            # Wait for all D2H copies to finish
+            for evt in [q_e, k_e, v_e, sc_e, ao_e, o_e]:
                 if evt is not None:
                     evt.synchronize()
             # Release GPU refs
             _gpu_refs.clear()
 
-            x = x_h.float()
+            # ── Get CPU input from chain state (NOT from GPU!) ──
+            cpu_input = rt.cpu_state_get(f"layer_input_{layer_idx}")
+            cpu_input_f = cpu_input.float()
+
+            # ── Input layernorm on CPU ──
+            x = _rms_norm_cpu(cpu_input_f, input_ln_w, input_ln_eps)
+
             prefix = f"layer{layer_idx}"
 
             def _slalom(tag, x_cpu, y_cpu, s, st):
@@ -280,7 +307,7 @@ class LlamaAttentionVerify(nn.Module):
                     errors.append(f"{tag} Freivalds failed: loss={loss:.6e}")
                 profiler.add("verify", "matmul_freivalds", dt, tag=tag, ok=ok, extra=f"loss={loss:.6e}")
 
-            # ── 1. Verify Q/K/V projections (SLALOM) ──
+            # ── 1. Verify Q/K/V projections (SLALOM) — input from CPU chain ──
             _slalom(f"{prefix}.q", x, q_h.float(), q_s, q_st)
             _slalom(f"{prefix}.k", x, k_h.float(), k_s, k_st)
             _slalom(f"{prefix}.v", x, v_h.float(), v_s, v_st)
@@ -343,8 +370,17 @@ class LlamaAttentionVerify(nn.Module):
             # ── 7. Verify O projection (SLALOM, CPU chain input) ──
             _slalom(f"{prefix}.o", attn_cpu, o_h.float(), o_s, o_st)
 
+            # ── 8. Compute attention output + residual on CPU ──
+            attn_output = o_h.float()
+            if o_bias is not None:
+                attn_output = attn_output + o_bias
+            post_attn = cpu_input_f + attn_output           # residual connection
+
+            # Store post-attention state for MLP chain
+            rt.cpu_state_set(f"post_attn_{layer_idx}", post_attn)
+
             # Record CPU chain non-linear recomputation
             profiler.add("verify", "cpu_chain_nonlinear", 0.0, tag=prefix, ok=True,
-                         extra="q_norm,k_norm,rope,softmax,sigmoid")
+                         extra="layernorm,q_norm,k_norm,rope,softmax,sigmoid,residual")
 
         rt._enqueue(_chain)

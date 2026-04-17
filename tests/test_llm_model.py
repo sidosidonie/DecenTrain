@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from verified_diffusers.zimage.config import VerifyConfig
+from verified_core.config import VerifyConfig
 from verified_llm.llm_model import create_llm_model
 
 

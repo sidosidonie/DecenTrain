@@ -17,8 +17,8 @@ import torch.nn.functional as F
 from diffusers.models.attention_processor import Attention
 
 from verified_diffusers.zimage.layers import VerifyLinearModule
-from verified_diffusers.zimage.runtime import VerifyRuntime
-from verified_llm.verify_linear import freivalds_batch_matmul, slalom_verify_preprocessed
+from verified_core.runtime import VerifyRuntime
+from verified_core.verify_linear import freivalds_batch_matmul, slalom_verify_preprocessed
 
 
 def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:

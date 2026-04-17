@@ -8,8 +8,8 @@ from diffusers.models.transformers.transformer_z_image import ZImageTransformer2
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from verified_diffusers.zimage.config import VerifyConfig
-from verified_diffusers.zimage.runtime import VerifyRuntime
+from verified_core.config import VerifyConfig
+from verified_core.runtime import VerifyRuntime
 from verified_diffusers.zimage.transformer import VerifiedZImageTransformer2DModel
 
 

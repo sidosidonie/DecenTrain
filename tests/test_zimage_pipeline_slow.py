@@ -8,7 +8,7 @@ from diffusers import DiffusionPipeline
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from verified_diffusers.zimage.config import VerifyConfig
+from verified_core.config import VerifyConfig
 from verified_diffusers.zimage.pipeline import patch_zimage_pipeline
 
 
