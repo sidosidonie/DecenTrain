@@ -52,3 +52,4 @@ local-PCIe4:
 local-PCIe5:
   bandwidth_gbps: 512           # PCIe 5.0 x16
   latency_us: 0
+

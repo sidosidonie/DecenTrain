@@ -1,0 +1,52 @@
+calibration:
+  version: 1
+  timestamp: '2026-04-17T08:58:14.472925'
+  machine:
+    cpu: Intel(R) Core(TM) Ultra 7 265K
+    cpu_cores: 18
+    gpu: NVIDIA GeForce RTX 5090
+    gpu_count: 1
+    gpu_memory_gb: 34.2
+    pytorch: 2.9.0+cu128
+  benchmark:
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    model_type: llm
+    dtype: bf16
+    freivalds_k: 4
+    peak_vram_mb: 2270.0
+    seq_len: 1024
+    gen_tokens: 10
+  measured:
+    origin:
+      forward_ms: 33.32
+      prefill_ms: 112.7
+      decode_avg_ms: 39.74
+      decode_tok_per_sec: 25.2
+    verified:
+      forward_ms: 1485.97
+      prefill_ms: 99.61
+      decode_avg_ms: 104.54
+      decode_tok_per_sec: 9.6
+      overhead_forward: 44.59
+      overhead_decode: 2.63
+  profiler:
+    total_checks: 2424
+    total_failures: 1310
+    pass_rate_pct: 46.0
+    skipped: 0
+    linear_verify:
+      count: 1848
+      avg_ms: 0.451
+    matmul_verify:
+      count: 48
+      avg_ms: 0.298
+    elementwise_verify:
+      count: 0
+      avg_ms: 0.0
+    transfer_linear_avg_ms: 0.0
+    transfer_matmul_avg_ms: 0.0
+  factors:
+    gpu_decode_ms: 39.74
+    verified_decode_ms: 104.54
+    linear_verify_ms: 0.451
+    matmul_verify_ms: 0.298

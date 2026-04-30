@@ -1,0 +1,71 @@
+# 1 CPU TEE + 8 consumer GPUs (4x RTX-4090 + 4x RTX-5090)
+# Each GPU runs Qwen2.5-7B standalone, all verified by the same CPU.
+# Stress-tests aggregate verification load: 8x ~14GB models, 8 parallel
+# verify streams sharing one CPU and one network link.
+
+cpu:
+  preset: Xeon-8480+
+  tee: tdx
+
+clusters:
+  - name: "5090-7b-a"
+    gpu_type: RTX-5090
+    count: 1
+    strategy: standalone
+    model: Qwen2.5-7B
+
+  - name: "5090-7b-b"
+    gpu_type: RTX-5090
+    count: 1
+    strategy: standalone
+    model: Qwen2.5-7B
+
+  - name: "5090-7b-c"
+    gpu_type: RTX-5090
+    count: 1
+    strategy: standalone
+    model: Qwen2.5-7B
+
+  - name: "5090-7b-d"
+    gpu_type: RTX-5090
+    count: 1
+    strategy: standalone
+    model: Qwen2.5-7B
+
+  - name: "4090-7b-a"
+    gpu_type: RTX-4090
+    count: 1
+    strategy: standalone
+    model: Qwen2.5-7B
+
+  - name: "4090-7b-b"
+    gpu_type: RTX-4090
+    count: 1
+    strategy: standalone
+    model: Qwen2.5-7B
+
+  - name: "4090-7b-c"
+    gpu_type: RTX-4090
+    count: 1
+    strategy: standalone
+    model: Qwen2.5-7B
+
+  - name: "4090-7b-d"
+    gpu_type: RTX-4090
+    count: 1
+    strategy: standalone
+    model: Qwen2.5-7B
+
+network:
+  preset: 10GbE
+
+verify:
+  use_slalom: true
+  freivalds_k: 10
+  verify_every_n: 1
+  compression: fp16
+
+inference:
+  batch_size: 1
+  seq_len: 32
+  gen_tokens: 50

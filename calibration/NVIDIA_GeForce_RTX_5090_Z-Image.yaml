@@ -1,0 +1,47 @@
+calibration:
+  version: 1
+  timestamp: '2026-04-17T08:15:36.087871'
+  machine:
+    cpu: Intel(R) Core(TM) Ultra 7 265K
+    cpu_cores: 18
+    gpu: NVIDIA GeForce RTX 5090
+    gpu_count: 1
+    gpu_memory_gb: 34.2
+    pytorch: 2.9.0+cu128
+  benchmark:
+    model: Tongyi-MAI/Z-Image
+    model_type: diffusion
+    dtype: bf16
+    freivalds_k: 4
+    peak_vram_mb: 27995.0
+    num_steps: 1
+  measured:
+    origin:
+      total_ms: 280.94
+      per_step_ms: 280.94
+    verified:
+      total_ms: 8103.25
+      per_step_ms: 8103.25
+      overhead: 28.84
+  profiler:
+    total_checks: 1458
+    total_failures: 3
+    pass_rate_pct: 99.8
+    skipped: 6
+    linear_verify:
+      count: 822
+      avg_ms: 6.803
+    matmul_verify:
+      count: 204
+      avg_ms: 47.426
+    elementwise_verify:
+      count: 0
+      avg_ms: 0.0
+    transfer_linear_avg_ms: 0.196
+    transfer_matmul_avg_ms: 0.0
+  factors:
+    gpu_step_ms: 280.94
+    verified_step_ms: 8103.25
+    linear_verify_ms: 6.803
+    matmul_verify_ms: 47.426
+    transfer_linear_ms: 0.196
