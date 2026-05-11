@@ -353,6 +353,9 @@ def test_fault_scale_y2_scales_third_output():
          _WorkerProc(inject_fault="scale_y2") as bad:
         clean_acts = _run_one_round_collect_acts(clean, hidden=8, inter=16)
         bad_acts = _run_one_round_collect_acts(bad, hidden=8, inter=16)
+        # First catch the no-op regression: bad must actually differ from clean.
+        assert not torch.allclose(bad_acts[m.OP_W2], clean_acts[m.OP_W2])
+        # Then verify the scale factor.
         assert torch.allclose(bad_acts[m.OP_W2], clean_acts[m.OP_W2] * 1.01,
                               atol=1e-4)
 
