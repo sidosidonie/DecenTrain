@@ -2,6 +2,7 @@
 Freivalds' algorithm for probabilistic matrix multiplication verification,
 and VerifyLinear — a verified linear layer backed by VerifyRuntime.
 """
+
 from __future__ import annotations
 
 import logging
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Random vector cache (reuse across calls for same shape)
 # ---------------------------------------------------------------------------
 
+
 class _RandomVecCache:
     def __init__(self):
         self._cache: dict[str, torch.Tensor] = {}
@@ -32,7 +34,6 @@ class _RandomVecCache:
 
 _rand_vec_cache = _RandomVecCache()
 
-
 # ---------------------------------------------------------------------------
 # SLALOM preprocessed Freivalds verification (Tramer & Boneh, ICLR 2019)
 #
@@ -40,6 +41,7 @@ _rand_vec_cache = _RandomVecCache()
 # offline. Online verification becomes y @ s == x @ s_tilde (two dot
 # products) at O(n*k) cost instead of O(n^2*k).
 # ---------------------------------------------------------------------------
+
 
 def slalom_precompute(
     weight_t: torch.Tensor,
@@ -99,7 +101,7 @@ def slalom_verify_preprocessed(
     Returns:
         Relative MSE: mean((y@s - x@s_tilde)^2) / (mean((y@s)^2) + eps).
     """
-    y_s = torch.matmul(y, s)          # [..., k]
+    y_s = torch.matmul(y, s)  # [..., k]
     x_st = torch.matmul(x, s_tilde)  # [..., k]
     diff_sq = (y_s - x_st).pow(2).mean()
     signal_sq = y_s.pow(2).mean().clamp(min=1e-10)
@@ -109,6 +111,7 @@ def slalom_verify_preprocessed(
 # ---------------------------------------------------------------------------
 # Noise injection (for threat-model testing)
 # ---------------------------------------------------------------------------
+
 
 def add_noise(C: torch.Tensor, noise_scale: float | None = None) -> torch.Tensor:
     if noise_scale is None or noise_scale == 0:
@@ -121,9 +124,13 @@ def add_noise(C: torch.Tensor, noise_scale: float | None = None) -> torch.Tensor
 # Freivalds' algorithm variants
 # ---------------------------------------------------------------------------
 
+
 def freivalds_batch_matmul_bias(
-    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
-    bias: torch.Tensor | None, k: int = 10,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    bias: torch.Tensor | None,
+    k: int = 10,
 ) -> float:
     """Verify C = A @ B + bias (batched). Returns relative MSE."""
     assert A.device == B.device == C.device
@@ -140,8 +147,11 @@ def freivalds_batch_matmul_bias(
 
 
 def freivalds_algorithm_2d_bias(
-    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
-    bias: torch.Tensor | None = None, k: int = 10,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    k: int = 10,
 ) -> float:
     """Verify C = A @ B + bias (2D). Returns relative MSE."""
     assert A.device == B.device == C.device
@@ -157,7 +167,9 @@ def freivalds_algorithm_2d_bias(
     return (diff_sq / signal_sq).item()
 
 
-def freivalds_batch_matmul(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10) -> float:
+def freivalds_batch_matmul(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10
+) -> float:
     """Verify C = A @ B (batched, no bias). Returns relative MSE."""
     assert A.device == B.device == C.device
     r = _rand_vec_cache.get(C.shape[-1], k, A.dtype)
@@ -169,7 +181,9 @@ def freivalds_batch_matmul(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k:
     return (diff_sq / signal_sq).item()
 
 
-def freivalds_batch_matmul_parallel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10) -> float:
+def freivalds_batch_matmul_parallel(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10
+) -> float:
     """Verify C = A @ B with A@Br and C@r computed in parallel. Returns relative MSE."""
     assert A.device == B.device == C.device
     r = _rand_vec_cache.get(C.shape[-1], k, A.dtype)
@@ -186,7 +200,9 @@ def freivalds_batch_matmul_parallel(A: torch.Tensor, B: torch.Tensor, C: torch.T
     return (diff_sq / signal_sq).item()
 
 
-def freivalds_algorithm_2d(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10) -> float:
+def freivalds_algorithm_2d(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10
+) -> float:
     """Verify C = A @ B (2D). Returns relative MSE."""
     assert A.device == B.device == C.device
     r = _rand_vec_cache.get(C.shape[-1], k, A.dtype)
@@ -198,7 +214,13 @@ def freivalds_algorithm_2d(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k:
     return (diff_sq / signal_sq).item()
 
 
-def freivalds_algorithm_bias(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, bias: torch.Tensor | None, k: int = 10) -> float:
+def freivalds_algorithm_bias(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    bias: torch.Tensor | None,
+    k: int = 10,
+) -> float:
     """Dispatch to 2D or batched bias variant based on input rank."""
     if len(A.shape) > 2:
         return freivalds_batch_matmul_bias(A, B, C, bias, k)
@@ -208,7 +230,9 @@ def freivalds_algorithm_bias(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, 
         raise ValueError(f"Invalid shape: {A.shape}")
 
 
-def freivalds_algorithm(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10) -> float:
+def freivalds_algorithm(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: int = 10
+) -> float:
     """Dispatch to 2D or batched variant based on input rank."""
     if len(A.shape) > 2:
         return freivalds_batch_matmul_parallel(A, B, C, k)
@@ -221,6 +245,7 @@ def freivalds_algorithm(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, k: in
 # ---------------------------------------------------------------------------
 # GPU → CPU async copy
 # ---------------------------------------------------------------------------
+
 
 def copy_to_cpu(x_device: torch.Tensor, stream_copy: torch.cuda.Stream):
     """Async copy a GPU tensor to pinned CPU memory on the given stream."""
@@ -239,6 +264,7 @@ def copy_to_cpu(x_device: torch.Tensor, stream_copy: torch.cuda.Stream):
 # VerifyLinear — async-verified linear layer via VerifyRuntime
 # ---------------------------------------------------------------------------
 
+
 class VerifyLinear:
     """Verified linear layer backed by VerifyRuntime.
 
@@ -253,10 +279,18 @@ class VerifyLinear:
         CPU chain (used by LlamaAttentionVerify / LlamaMLPVerify)
     """
 
-    def __init__(self, linear: torch.nn.Linear, runtime, tag: str = "linear", noise: float | None = None):
+    def __init__(
+        self,
+        linear: torch.nn.Linear,
+        runtime,
+        tag: str = "linear",
+        noise: float | None = None,
+    ):
         from verified_core.runtime import VerifyRuntime
 
-        assert isinstance(runtime, VerifyRuntime), "VerifyLinear requires a VerifyRuntime instance"
+        assert isinstance(
+            runtime, VerifyRuntime
+        ), "VerifyLinear requires a VerifyRuntime instance"
 
         self.linear = linear
         self.runtime = runtime
@@ -275,14 +309,21 @@ class VerifyLinear:
         )
 
         # Bias on CPU for chain verification.
-        self.bias_cpu = linear.bias.detach().float().to("cpu") if linear.bias is not None else None
+        self.bias_cpu = (
+            linear.bias.detach().float().to("cpu") if linear.bias is not None else None
+        )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """GPU forward + auto-submit SLALOM verification (legacy mode)."""
-        out = self.forward_gpu_only(input)  # Ensure noise is added in GPU-only path as well.
+        out = self.forward_gpu_only(
+            input
+        )  # Ensure noise is added in GPU-only path as well.
         self.runtime.submit_linear_preprocessed(
-            tag=self.tag, x_gpu=input, y_gpu=out,
-            s=self.s, s_tilde=self.s_tilde,
+            tag=self.tag,
+            x_gpu=input,
+            y_gpu=out,
+            s=self.s,
+            s_tilde=self.s_tilde,
         )
         return out
 
