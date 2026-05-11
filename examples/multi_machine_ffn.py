@@ -60,6 +60,36 @@ SLALOM_K = 10
 S_GENERATOR_SEED = 0xDEADBEEF  # fixed so tests are deterministic
 
 
+# ── Weight initialization ───────────────────────────────────────────
+def make_weights(
+    hidden: int,
+    inter: int,
+    seed: int,
+    dtype: torch.dtype,
+    device: str | torch.device,
+) -> tuple[nn.Linear, nn.Linear, nn.Linear]:
+    """Build SwiGLU weights (w1, w2, w3) deterministic across CPU/GPU.
+
+    We always sample on the CPU with std=0.02, then `.to(device, dtype)`,
+    so the coordinator (CPU fp32) and worker (GPU fp16) get bit-identical
+    weights up to the dtype downcast.
+
+    Returns (w1, w2, w3) — same order as zimage/mlp.py for consistency.
+    """
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def _lin(in_dim: int, out_dim: int) -> nn.Linear:
+        m = nn.Linear(in_dim, out_dim, bias=False)
+        with torch.no_grad():
+            m.weight.normal_(0.0, 0.02, generator=gen)
+        return m.to(device=device, dtype=dtype)
+
+    w1 = _lin(hidden, inter)
+    w3 = _lin(hidden, inter)
+    w2 = _lin(inter, hidden)
+    return w1, w2, w3
+
+
 def main() -> int:  # pragma: no cover - filled in last task
     raise NotImplementedError
 
