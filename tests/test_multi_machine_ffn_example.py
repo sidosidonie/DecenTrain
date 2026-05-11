@@ -395,3 +395,37 @@ def test_coordinator_connect_loads_weights_and_builds_slalom():
             assert coord.s_tilde_w2.shape == (16, m.SLALOM_K)
         finally:
             coord.close()
+
+
+def test_coordinator_run_round_clean_passes_verification():
+    m = _load_module()
+    with _WorkerProc() as wp:
+        cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                          wire_dtype=m.DTYPE_FP32, weight_seed=42)
+        coord = m.Coordinator(host="127.0.0.1", port=wp.port, config=cfg,
+                              threshold=1e-3)
+        try:
+            coord.connect_and_load()
+            rm = coord.run_round(request_id=1, input_seed=99)
+            assert rm.ok is True
+            assert rm.mse_w1 < 1e-3
+            assert rm.mse_w3 < 1e-3
+            assert rm.mse_w2 < 1e-3
+        finally:
+            coord.close()
+
+
+def test_coordinator_run_round_with_flip_y1_caught():
+    m = _load_module()
+    with _WorkerProc(inject_fault="flip_y1") as wp:
+        cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                          wire_dtype=m.DTYPE_FP32, weight_seed=42)
+        coord = m.Coordinator(host="127.0.0.1", port=wp.port, config=cfg,
+                              threshold=1e-3)
+        try:
+            coord.connect_and_load()
+            rm = coord.run_round(request_id=1, input_seed=99)
+            assert rm.ok is False
+            assert rm.mse_w1 > 1e-3
+        finally:
+            coord.close()

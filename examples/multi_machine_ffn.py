@@ -336,6 +336,30 @@ class Worker:
         raise ValueError(f"unknown inject_fault: {self.inject_fault}")
 
 
+# ── Metrics ─────────────────────────────────────────────────────────
+@dataclass
+class RoundMetrics:
+    request_id: int
+    # Phase timings (ms)
+    coord_send_t: float = 0.0
+    gpu_forward_t: float = 0.0
+    wire_recv_t: float = 0.0
+    cpu_verify_t: float = 0.0
+    cpu_verify_w1_t: float = 0.0
+    cpu_verify_w3_t: float = 0.0
+    cpu_verify_w2_t: float = 0.0
+    end_to_end_t: float = 0.0
+    # Bytes
+    bytes_sent: int = 0
+    bytes_recv: int = 0
+    bytes_recv_predicted: int = 0
+    # Verification
+    mse_w1: float = 0.0
+    mse_w3: float = 0.0
+    mse_w2: float = 0.0
+    ok: bool = True
+
+
 # ── Coordinator ─────────────────────────────────────────────────────
 @dataclass
 class FFNConfig:
@@ -394,6 +418,94 @@ class Coordinator:
             self.sock.close()
             self.sock = None
         self.pool.shutdown(wait=False)
+
+    def reproduce_input_cpu(self, input_seed: int) -> torch.Tensor:
+        gen = torch.Generator(device="cpu").manual_seed(input_seed)
+        return torch.randn(self.config.batch, self.config.seq,
+                            self.config.hidden,
+                            dtype=torch.float32, generator=gen)
+
+    def predicted_recv_bytes(self) -> int:
+        # 3 ACTIVATION frames (3D tensors) + 1 FORWARD_DONE frame
+        frame_hdr = 8
+        activation_body_hdr = 11 + 4 * 3  # Q+B+B+B + 3 shape u32
+        done_body = 16
+        dtype_size = _DTYPE_SIZE[self.config.wire_dtype]
+        cfg = self.config
+        y1_bytes = cfg.batch * cfg.seq * cfg.inter * dtype_size
+        y3_bytes = cfg.batch * cfg.seq * cfg.inter * dtype_size
+        y2_bytes = cfg.batch * cfg.seq * cfg.hidden * dtype_size
+        return 3 * (frame_hdr + activation_body_hdr) + (frame_hdr + done_body) \
+               + y1_bytes + y3_bytes + y2_bytes
+
+    def run_round(self, request_id: int, input_seed: int) -> RoundMetrics:
+        assert self.sock is not None, "call connect_and_load() first"
+        rm = RoundMetrics(request_id=request_id)
+        rm.bytes_recv_predicted = self.predicted_recv_bytes()
+
+        x_cpu = self.reproduce_input_cpu(input_seed)
+
+        # Send FORWARD_REQ
+        t_start = time.perf_counter()
+        req_body = pack_forward_req(request_id, input_seed,
+                                     self.config.batch, self.config.seq)
+        rm.bytes_sent = send_msg(self.sock, MSG_FORWARD_REQ, req_body)
+
+        # Receive 3 ACTIVATION + 1 FORWARD_DONE
+        t_wire_start = time.perf_counter()
+        bytes_recv = 0
+        first_act_t: Optional[float] = None
+        acts: dict[int, torch.Tensor] = {}
+        gpu_forward_t_ms = 0.0
+        done = False
+        while not done or len(acts) < 3:
+            mt, body = recv_msg(self.sock)
+            bytes_recv += 8 + len(body)
+            if mt == MSG_ACTIVATION:
+                if first_act_t is None:
+                    first_act_t = time.perf_counter()
+                d = unpack_activation(body)
+                acts[d["op_tag"]] = d["tensor"]
+            elif mt == MSG_FORWARD_DONE:
+                d = unpack_forward_done(body)
+                gpu_forward_t_ms = d["gpu_forward_t_ms"]
+                done = True
+            else:
+                raise WireProtocolError(f"unexpected msg_type {mt}")
+        t_wire_end = time.perf_counter()
+        rm.bytes_recv = bytes_recv
+        rm.gpu_forward_t = gpu_forward_t_ms
+        rm.coord_send_t = ((first_act_t or t_wire_end) - t_start) * 1000.0
+        rm.wire_recv_t = (t_wire_end - t_wire_start) * 1000.0
+
+        # Verify (w1 and w3 in parallel; w2 after gated_cpu is built)
+        t_verify_start = time.perf_counter()
+        y1 = acts[OP_W1].to(torch.float32)
+        y3 = acts[OP_W3].to(torch.float32)
+        y2 = acts[OP_W2].to(torch.float32)
+
+        def _timed(fn, *args):
+            t0 = time.perf_counter()
+            mse = fn(*args)
+            return mse, (time.perf_counter() - t0) * 1000.0
+
+        f_w1 = self.pool.submit(_timed, slalom_verify,
+                                x_cpu, y1, self.s_w1, self.s_tilde_w1)
+        f_w3 = self.pool.submit(_timed, slalom_verify,
+                                x_cpu, y3, self.s_w3, self.s_tilde_w3)
+        rm.mse_w1, rm.cpu_verify_w1_t = f_w1.result()
+        rm.mse_w3, rm.cpu_verify_w3_t = f_w3.result()
+        gated_cpu = F.silu(y1) * y3
+        f_w2 = self.pool.submit(_timed, slalom_verify,
+                                gated_cpu, y2, self.s_w2, self.s_tilde_w2)
+        rm.mse_w2, rm.cpu_verify_w2_t = f_w2.result()
+        rm.cpu_verify_t = (time.perf_counter() - t_verify_start) * 1000.0
+        rm.end_to_end_t = (time.perf_counter() - t_start) * 1000.0
+
+        rm.ok = (rm.mse_w1 <= self.threshold
+                 and rm.mse_w3 <= self.threshold
+                 and rm.mse_w2 <= self.threshold)
+        return rm
 
 
 # ── Main (incremental — full CLI in last task) ──────────────────────
