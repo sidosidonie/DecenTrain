@@ -100,6 +100,51 @@ def test_slalom_verify_catches_corrupted_y():
     assert mse > 1e-7, f"expected detectable mse, got {mse}"
 
 
+def test_slalom_verify_safe_returns_inf_on_nan_y():
+    """NaN-poisoned y must trip the safe wrapper (not silently pass)."""
+    m = _load_module()
+    torch.manual_seed(0)
+    w1, _, _ = m.make_weights(hidden=8, inter=16, seed=42,
+                                dtype=torch.float32, device="cpu")
+    x = torch.randn(2, 4, 8)
+    y = w1(x)
+    y[0, 0, 0] = float("nan")
+    s = m.make_s(out_dim=16, k=10, seed=7)
+    s_tilde = m.precompute_s_tilde(w1.weight, s)
+    mse = m.slalom_verify_safe(x, y, s, s_tilde)
+    assert mse == float("inf")
+
+
+def test_slalom_verify_safe_returns_inf_on_inf_y():
+    """Inf in y must also trip the safe wrapper."""
+    m = _load_module()
+    torch.manual_seed(0)
+    w1, _, _ = m.make_weights(hidden=8, inter=16, seed=42,
+                                dtype=torch.float32, device="cpu")
+    x = torch.randn(2, 4, 8)
+    y = w1(x)
+    y[0, 0, 0] = float("inf")
+    s = m.make_s(out_dim=16, k=10, seed=7)
+    s_tilde = m.precompute_s_tilde(w1.weight, s)
+    mse = m.slalom_verify_safe(x, y, s, s_tilde)
+    assert mse == float("inf")
+
+
+def test_slalom_verify_safe_matches_slalom_verify_when_finite():
+    """For clean y, safe wrapper returns identical mse to base function."""
+    m = _load_module()
+    torch.manual_seed(0)
+    w1, _, _ = m.make_weights(hidden=8, inter=16, seed=42,
+                                dtype=torch.float32, device="cpu")
+    x = torch.randn(2, 4, 8)
+    y = w1(x)
+    s = m.make_s(out_dim=16, k=10, seed=7)
+    s_tilde = m.precompute_s_tilde(w1.weight, s)
+    base = m.slalom_verify(x, y, s, s_tilde)
+    safe = m.slalom_verify_safe(x, y, s, s_tilde)
+    assert base == safe
+
+
 def test_precompute_s_tilde_shape():
     m = _load_module()
     w1, _, _ = m.make_weights(hidden=8, inter=16, seed=42, dtype=torch.float32, device="cpu")
@@ -600,6 +645,44 @@ def test_inject_scale_y2_caught_through_coordinator():
         # w1, w3 should still pass (only y2 was tampered with)
         assert all(r.mse_w1 < threshold and r.mse_w3 < threshold
                    for r in results)
+
+
+def test_coordinator_rejects_wrong_shape_activation():
+    """If worker sends ACTIVATION with wrong shape, coord raises WireProtocolError."""
+    import pytest
+    m = _load_module()
+    # Build a coordinator (we'll swap its socket for a socketpair so no
+    # real worker is needed for this path).
+    cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                      wire_dtype=m.DTYPE_FP32, weight_seed=42)
+    coord = m.Coordinator(host="127.0.0.1", port=1, config=cfg,
+                          threshold=1e-3)
+    a, b = _socket.socketpair()
+    try:
+        # Replace coord's sock with one end of the pair. Coordinator will
+        # write FORWARD_REQ into `a` (buffered by the kernel — nobody reads
+        # it) and then try to read a response. We pre-write a wrong-shape
+        # ACTIVATION into the other side so coord reads that.
+        coord.sock = a
+        wrong_tensor = torch.zeros(1, 4, 99)  # wrong inter dim (99 != 16)
+        body = m.pack_activation(request_id=1, op_tag=m.OP_W1,
+                                  tensor=wrong_tensor,
+                                  wire_dtype_id=m.DTYPE_FP32)
+        m.send_msg(b, m.MSG_ACTIVATION, body)
+        with pytest.raises(m.WireProtocolError, match="expected shape"):
+            coord.run_round(request_id=1, input_seed=99)
+    finally:
+        try:
+            a.close()
+        except OSError:
+            pass
+        try:
+            b.close()
+        except OSError:
+            pass
+        # Avoid double-close on coord.sock (already closed via `a` above).
+        coord.sock = None
+        coord.pool.shutdown(wait=False)
 
 
 def test_inject_drop_silu_caught_via_chain():

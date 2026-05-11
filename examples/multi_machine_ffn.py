@@ -122,6 +122,17 @@ def slalom_verify(
     return ((lhs - rhs) ** 2).mean().item()
 
 
+def slalom_verify_safe(x, y, s, s_tilde) -> float:
+    """Like slalom_verify but returns inf if y has any NaN/Inf.
+
+    Without this guard, a worker returning NaN-poisoned activations
+    would slip through (NaN > threshold is False, so ok would stay True).
+    """
+    if not torch.isfinite(y).all():
+        return float("inf")
+    return slalom_verify(x, y, s, s_tilde)
+
+
 # ── Wire primitives ─────────────────────────────────────────────────
 class WireProtocolError(RuntimeError):
     pass
@@ -374,15 +385,20 @@ def compute_round_rates(rm: RoundMetrics, cfg: FFNConfig, k: int) -> dict:
     gpu_gflops = _safe(rm.gpu_forward_t, ffn_flops, 1e9)
     verify_gflops = _safe(rm.cpu_verify_t, slalom_flops, 1e9)
 
+    # wire_recv_t measures (request-sent → last-byte-received). The worker's
+    # GPU forward happens during this window, so the actual on-wire portion
+    # is wire_recv_t minus gpu_forward_t. Subtract so the three phases sum
+    # to ~100% of e2e instead of double-counting GPU time.
     e2e = rm.end_to_end_t if rm.end_to_end_t > 0 else 1e-9
+    wire_only_t = max(0.0, rm.wire_recv_t - rm.gpu_forward_t)
     return {
         "wire_mbps": wire_mbps,
         "gpu_gflops": gpu_gflops,
         "verify_gflops": verify_gflops,
         "gpu_pct": rm.gpu_forward_t / e2e,
-        "wire_pct": rm.wire_recv_t / e2e,
+        "wire_pct": wire_only_t / e2e,
         "verify_pct": rm.cpu_verify_t / e2e,
-        "sum_pct": (rm.gpu_forward_t + rm.wire_recv_t + rm.cpu_verify_t) / e2e,
+        "sum_pct": (rm.gpu_forward_t + wire_only_t + rm.cpu_verify_t) / e2e,
     }
 
 
@@ -594,7 +610,20 @@ class Coordinator:
                 if first_act_t is None:
                     first_act_t = time.perf_counter()
                 d = unpack_activation(body)
-                acts[d["op_tag"]] = d["tensor"]
+                op_tag = d["op_tag"]
+                tensor = d["tensor"]
+                # Validate against expected per-layer shape.
+                expected_out = (self.config.inter
+                                if op_tag in (OP_W1, OP_W3)
+                                else self.config.hidden)
+                expected_shape = (self.config.batch, self.config.seq,
+                                   expected_out)
+                if tuple(tensor.shape) != expected_shape:
+                    raise WireProtocolError(
+                        f"op_tag={op_tag}: expected shape {expected_shape}, "
+                        f"got {tuple(tensor.shape)}"
+                    )
+                acts[op_tag] = tensor
             elif mt == MSG_FORWARD_DONE:
                 d = unpack_forward_done(body)
                 gpu_forward_t_ms = d["gpu_forward_t_ms"]
@@ -618,14 +647,14 @@ class Coordinator:
             mse = fn(*args)
             return mse, (time.perf_counter() - t0) * 1000.0
 
-        f_w1 = self.pool.submit(_timed, slalom_verify,
+        f_w1 = self.pool.submit(_timed, slalom_verify_safe,
                                 x_cpu, y1, self.s_w1, self.s_tilde_w1)
-        f_w3 = self.pool.submit(_timed, slalom_verify,
+        f_w3 = self.pool.submit(_timed, slalom_verify_safe,
                                 x_cpu, y3, self.s_w3, self.s_tilde_w3)
         rm.mse_w1, rm.cpu_verify_w1_t = f_w1.result()
         rm.mse_w3, rm.cpu_verify_w3_t = f_w3.result()
         gated_cpu = F.silu(y1) * y3
-        f_w2 = self.pool.submit(_timed, slalom_verify,
+        f_w2 = self.pool.submit(_timed, slalom_verify_safe,
                                 gated_cpu, y2, self.s_w2, self.s_tilde_w2)
         rm.mse_w2, rm.cpu_verify_w2_t = f_w2.result()
         rm.cpu_verify_t = (time.perf_counter() - t_verify_start) * 1000.0
