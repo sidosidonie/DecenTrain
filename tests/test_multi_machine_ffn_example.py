@@ -547,3 +547,80 @@ def test_loopback_role_runs_end_to_end(tmp_path):
     import json as _json
     data = _json.loads(json_path.read_text())
     assert data["summary"]["rounds_passed"] == 4  # 5 - 1 warmup
+
+
+def test_close_message_shuts_worker_within_two_seconds():
+    m = _load_module()
+    with _WorkerProc() as wp:
+        with _socket.create_connection(("127.0.0.1", wp.port)) as sock:
+            m.send_msg(sock, m.MSG_LOAD_REQ,
+                       m.pack_load_req(hidden=8, inter=16,
+                                        weight_seed=42, dtype_id=m.DTYPE_FP32))
+            m.recv_msg(sock)
+            m.send_msg(sock, m.MSG_CLOSE, b"")
+        rc = wp.proc.wait(timeout=2)
+        assert rc == 0
+
+
+def test_wire_dtype_fp16_runs_clean(tmp_path):
+    cmd = [_sys.executable, str(EXAMPLE_PATH),
+           "--role", "loopback",
+           "--rounds", "3", "--warmup", "0",
+           "--hidden", "16", "--inter", "32",
+           "--batch", "1", "--seq", "4",
+           "--wire-dtype", "fp16",
+           "--device", "cpu",
+           "--threshold", "1e-2"]  # fp16 round-trip is noisier
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, f"stderr={res.stderr}\nstdout={res.stdout}"
+    assert "rounds passed     3 / 3" in res.stdout
+
+
+def test_inject_scale_y2_caught_through_coordinator():
+    # At small dims (inter=16) y2*1.01 produces mse_w2 ~3e-12..7e-11,
+    # well above the clean baseline (~1e-20) but far below the 1e-3
+    # threshold used in other tests. We calibrate the threshold to the
+    # test setup (mirrors Task 3's 1e-7 unit-test calibration). Production
+    # thresholds at inter=11008 are higher because the same forgery
+    # scales linearly with output dim.
+    m = _load_module()
+    threshold = 1e-12
+    with _WorkerProc(inject_fault="scale_y2") as wp:
+        cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                          wire_dtype=m.DTYPE_FP32, weight_seed=42)
+        coord = m.Coordinator(host="127.0.0.1", port=wp.port, config=cfg,
+                              threshold=threshold)
+        try:
+            coord.connect_and_load()
+            results = coord.run_many(rounds=3)
+        finally:
+            coord.close()
+        assert all(not r.ok for r in results)
+        assert all(r.mse_w2 > threshold for r in results)
+        # w1, w3 should still pass (only y2 was tampered with)
+        assert all(r.mse_w1 < threshold and r.mse_w3 < threshold
+                   for r in results)
+
+
+def test_inject_drop_silu_caught_via_chain():
+    # Worker's broken SiLU is caught by the third SLALOM check because
+    # coord computes SiLU on CPU from its own y1, y3, so the gated input
+    # to w2's check differs from what the worker actually used. drop_silu
+    # at inter=16 yields mse_w2 ~3e-8..5e-7 — calibrated threshold 1e-12
+    # catches it cleanly while clean rounds (mse ~1e-20) stay below.
+    m = _load_module()
+    threshold = 1e-12
+    with _WorkerProc(inject_fault="drop_silu") as wp:
+        cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                          wire_dtype=m.DTYPE_FP32, weight_seed=42)
+        coord = m.Coordinator(host="127.0.0.1", port=wp.port, config=cfg,
+                              threshold=threshold)
+        try:
+            coord.connect_and_load()
+            results = coord.run_many(rounds=3)
+        finally:
+            coord.close()
+        assert all(not r.ok for r in results)
+        assert all(r.mse_w2 > threshold for r in results)
+        assert all(r.mse_w1 < threshold and r.mse_w3 < threshold
+                   for r in results)
