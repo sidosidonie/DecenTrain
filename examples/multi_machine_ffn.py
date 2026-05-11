@@ -702,15 +702,25 @@ def launch_loopback(args) -> int:
         _wait_port(port)
         return run_coordinator("127.0.0.1", port, args)
     finally:
+        # Coordinator.close() already sent CLOSE; give worker a moment to
+        # exit cleanly before we SIGTERM it. Otherwise every clean run prints
+        # a spurious "worker exited with -15" line.
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
         if proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        if proc.returncode and proc.returncode != 0:
+        # Only surface stderr for genuinely unexpected non-zero exits.
+        # -SIGTERM (-15) means we deliberately killed it after our own timeout.
+        rc = proc.returncode
+        if rc is not None and rc != 0 and rc != -15:
             err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
-            sys.stderr.write(f"worker exited with {proc.returncode}\n{err}\n")
+            sys.stderr.write(f"worker exited with {rc}\n{err}\n")
 
 
 def main() -> int:
