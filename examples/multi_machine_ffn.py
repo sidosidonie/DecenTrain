@@ -153,6 +153,70 @@ def recv_msg(sock: socket.socket) -> tuple[int, bytes]:
     return msg_type, body
 
 
+# ── Wire message bodies ─────────────────────────────────────────────
+def pack_load_req(hidden: int, inter: int, weight_seed: int, dtype_id: int) -> bytes:
+    return struct.pack("<IIII", hidden, inter, weight_seed, dtype_id)
+
+
+def unpack_load_req(body: bytes) -> dict:
+    hidden, inter, weight_seed, dtype_id = struct.unpack("<IIII", body)
+    return {"hidden": hidden, "inter": inter, "weight_seed": weight_seed, "dtype_id": dtype_id}
+
+
+def pack_load_ack(status: int) -> bytes:
+    return struct.pack("<B", status)
+
+
+def unpack_load_ack(body: bytes) -> dict:
+    (status,) = struct.unpack("<B", body)
+    return {"status": status}
+
+
+def pack_forward_req(request_id: int, input_seed: int, batch: int, seq: int) -> bytes:
+    return struct.pack("<QIII", request_id, input_seed, batch, seq)
+
+
+def unpack_forward_req(body: bytes) -> dict:
+    request_id, input_seed, batch, seq = struct.unpack("<QIII", body)
+    return {"request_id": request_id, "input_seed": input_seed, "batch": batch, "seq": seq}
+
+
+def pack_activation(
+    request_id: int, op_tag: int, tensor: torch.Tensor, wire_dtype_id: int
+) -> bytes:
+    np_dtype = _NUMPY_DTYPE[wire_dtype_id]
+    torch_dtype = _TORCH_DTYPE[wire_dtype_id]
+    t = tensor.detach().to(torch_dtype).contiguous().cpu()
+    payload = t.numpy().astype(np_dtype, copy=False).tobytes()
+    ndim = t.ndim
+    shape_bytes = struct.pack(f"<{ndim}I", *t.shape)
+    header = struct.pack("<QBBB", request_id, op_tag, wire_dtype_id, ndim)
+    return header + shape_bytes + payload
+
+
+def unpack_activation(body: bytes) -> dict:
+    request_id, op_tag, dtype_id, ndim = struct.unpack_from("<QBBB", body, 0)
+    off = struct.calcsize("<QBBB")
+    shape = struct.unpack_from(f"<{ndim}I", body, off)
+    off += 4 * ndim
+    payload = body[off:]
+    np_dtype = _NUMPY_DTYPE[dtype_id]
+    torch_dtype = _TORCH_DTYPE[dtype_id]
+    arr = np.frombuffer(payload, dtype=np_dtype).reshape(shape)
+    # numpy buffer is read-only; .copy() before torch.from_numpy
+    tensor = torch.from_numpy(arr.copy()).to(torch_dtype)
+    return {"request_id": request_id, "op_tag": op_tag, "dtype_id": dtype_id, "tensor": tensor}
+
+
+def pack_forward_done(request_id: int, gpu_forward_t_ms: float) -> bytes:
+    return struct.pack("<Qd", request_id, gpu_forward_t_ms)
+
+
+def unpack_forward_done(body: bytes) -> dict:
+    request_id, gpu_forward_t_ms = struct.unpack("<Qd", body)
+    return {"request_id": request_id, "gpu_forward_t_ms": gpu_forward_t_ms}
+
+
 def main() -> int:  # pragma: no cover - filled in last task
     raise NotImplementedError
 

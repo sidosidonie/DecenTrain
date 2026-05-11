@@ -147,3 +147,37 @@ def test_recv_exactly_raises_on_eof():
             m.recv_exactly(b, 10)
     finally:
         b.close()
+
+
+def test_pack_unpack_load_req():
+    m = _load_module()
+    body = m.pack_load_req(hidden=4096, inter=11008, weight_seed=0xC0FFEE, dtype_id=m.DTYPE_FP16)
+    out = m.unpack_load_req(body)
+    assert out == {"hidden": 4096, "inter": 11008, "weight_seed": 0xC0FFEE, "dtype_id": m.DTYPE_FP16}
+
+
+def test_pack_unpack_forward_req():
+    m = _load_module()
+    body = m.pack_forward_req(request_id=7, input_seed=99, batch=1, seq=512)
+    out = m.unpack_forward_req(body)
+    assert out == {"request_id": 7, "input_seed": 99, "batch": 1, "seq": 512}
+
+
+def test_pack_unpack_activation_roundtrip():
+    m = _load_module()
+    t = torch.randn(2, 4, 8, dtype=torch.float16)
+    body = m.pack_activation(request_id=3, op_tag=m.OP_W1, tensor=t, wire_dtype_id=m.DTYPE_FP16)
+    out = m.unpack_activation(body)
+    assert out["request_id"] == 3
+    assert out["op_tag"] == m.OP_W1
+    assert out["tensor"].shape == (2, 4, 8)
+    assert out["tensor"].dtype == torch.float16
+    assert torch.allclose(out["tensor"], t)
+
+
+def test_pack_unpack_forward_done():
+    m = _load_module()
+    body = m.pack_forward_done(request_id=5, gpu_forward_t_ms=12.345)
+    out = m.unpack_forward_done(body)
+    assert out["request_id"] == 5
+    assert abs(out["gpu_forward_t_ms"] - 12.345) < 1e-9
