@@ -312,3 +312,59 @@ def test_worker_forward_produces_correct_outputs():
         done = m.unpack_forward_done(dones[0])
         assert done["request_id"] == 1
         assert done["gpu_forward_t_ms"] > 0
+
+
+def _run_one_round_collect_acts(wp, *, hidden, inter, input_seed=99,
+                                 batch=1, seq=4):
+    m = _load_module()
+    with _socket.create_connection(("127.0.0.1", wp.port)) as sock:
+        m.send_msg(sock, m.MSG_LOAD_REQ,
+                   m.pack_load_req(hidden=hidden, inter=inter,
+                                    weight_seed=42, dtype_id=m.DTYPE_FP32))
+        m.recv_msg(sock)
+        m.send_msg(sock, m.MSG_FORWARD_REQ,
+                   m.pack_forward_req(request_id=1, input_seed=input_seed,
+                                       batch=batch, seq=seq))
+        acts = {}
+        while len(acts) < 3:
+            mt, body = m.recv_msg(sock)
+            if mt == m.MSG_ACTIVATION:
+                d = m.unpack_activation(body)
+                acts[d["op_tag"]] = d["tensor"]
+        m.recv_msg(sock)  # FORWARD_DONE
+        m.send_msg(sock, m.MSG_CLOSE, b"")
+    return acts
+
+
+def test_fault_flip_y1_negates_first_output():
+    m = _load_module()
+    with _WorkerProc(inject_fault="none") as clean, \
+         _WorkerProc(inject_fault="flip_y1") as bad:
+        clean_acts = _run_one_round_collect_acts(clean, hidden=8, inter=16)
+        bad_acts = _run_one_round_collect_acts(bad, hidden=8, inter=16)
+        assert torch.allclose(bad_acts[m.OP_W1], -clean_acts[m.OP_W1])
+        # w3 unaffected
+        assert torch.allclose(bad_acts[m.OP_W3], clean_acts[m.OP_W3])
+
+
+def test_fault_scale_y2_scales_third_output():
+    m = _load_module()
+    with _WorkerProc(inject_fault="none") as clean, \
+         _WorkerProc(inject_fault="scale_y2") as bad:
+        clean_acts = _run_one_round_collect_acts(clean, hidden=8, inter=16)
+        bad_acts = _run_one_round_collect_acts(bad, hidden=8, inter=16)
+        assert torch.allclose(bad_acts[m.OP_W2], clean_acts[m.OP_W2] * 1.01,
+                              atol=1e-4)
+
+
+def test_fault_drop_silu_changes_y2_via_chain():
+    m = _load_module()
+    with _WorkerProc(inject_fault="none") as clean, \
+         _WorkerProc(inject_fault="drop_silu") as bad:
+        clean_acts = _run_one_round_collect_acts(clean, hidden=8, inter=16)
+        bad_acts = _run_one_round_collect_acts(bad, hidden=8, inter=16)
+        # y1 and y3 same as clean (linear projections unaffected)
+        assert torch.allclose(bad_acts[m.OP_W1], clean_acts[m.OP_W1])
+        assert torch.allclose(bad_acts[m.OP_W3], clean_acts[m.OP_W3])
+        # but y2 differs because gated was computed without SiLU
+        assert not torch.allclose(bad_acts[m.OP_W2], clean_acts[m.OP_W2])

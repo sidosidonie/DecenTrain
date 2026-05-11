@@ -322,8 +322,18 @@ class Worker:
                  pack_forward_done(request_id, gpu_t_ms))
 
     def _apply_fault(self, y1, y3, y2, gated):
-        """No-op for inject_fault='none'; overridden in Task 8."""
-        return y1, y3, y2
+        if self.inject_fault == "none":
+            return y1, y3, y2
+        if self.inject_fault == "flip_y1":
+            return -y1, y3, y2
+        if self.inject_fault == "scale_y2":
+            return y1, y3, y2 * 1.01
+        if self.inject_fault == "drop_silu":
+            # Recompute y2 with broken non-linear; ship that as y2.
+            gated_bad = y1 * y3  # missing SiLU
+            y2_bad = self.w2(gated_bad)
+            return y1, y3, y2_bad
+        raise ValueError(f"unknown inject_fault: {self.inject_fault}")
 
 
 # ── Main (incremental — full CLI in last task) ──────────────────────
