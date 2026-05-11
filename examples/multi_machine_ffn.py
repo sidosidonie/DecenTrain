@@ -90,6 +90,38 @@ def make_weights(
     return w1, w2, w3
 
 
+# ── SLALOM ──────────────────────────────────────────────────────────
+def make_s(out_dim: int, k: int, seed: int) -> torch.Tensor:
+    """Random projection vector. Shape (out_dim, k), fp32 on CPU."""
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    return torch.randn(out_dim, k, dtype=torch.float32, generator=gen)
+
+
+def precompute_s_tilde(weight: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """For nn.Linear y = x @ weight.T, compute s_tilde = weight.T @ s.
+
+    weight shape: (out, in).  s shape: (out, k).  Returns (in, k) fp32.
+    """
+    w = weight.detach().to(torch.float32).t().contiguous()  # (in, out)
+    return w @ s.to(torch.float32)  # (in, k)
+
+
+def slalom_verify(
+    x: torch.Tensor,        # (..., in)  fp32
+    y: torch.Tensor,        # (..., out) fp32 — received from worker
+    s: torch.Tensor,        # (out, k)   fp32
+    s_tilde: torch.Tensor,  # (in, k)    fp32
+) -> float:
+    """Return mean-squared-error between y@s and x@s_tilde.
+
+    A correct (x, y) pair gives ~0 mse. Any forged y that doesn't match
+    `x @ W.T` will diverge with high probability across k=10 projections.
+    """
+    lhs = y.to(torch.float32) @ s
+    rhs = x.to(torch.float32) @ s_tilde
+    return ((lhs - rhs) ** 2).mean().item()
+
+
 def main() -> int:  # pragma: no cover - filled in last task
     raise NotImplementedError
 
