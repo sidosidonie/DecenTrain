@@ -106,3 +106,44 @@ def test_make_s_deterministic_with_seed():
     a = m.make_s(out_dim=16, k=10, seed=7)
     b = m.make_s(out_dim=16, k=10, seed=7)
     assert torch.equal(a, b)
+
+
+import socket as _socket
+
+
+def test_send_recv_msg_roundtrip():
+    m = _load_module()
+    a, b = _socket.socketpair()
+    try:
+        m.send_msg(a, m.MSG_LOAD_REQ, b"hello")
+        msg_type, body = m.recv_msg(b)
+        assert msg_type == m.MSG_LOAD_REQ
+        assert body == b"hello"
+    finally:
+        a.close()
+        b.close()
+
+
+def test_send_recv_msg_empty_body():
+    m = _load_module()
+    a, b = _socket.socketpair()
+    try:
+        m.send_msg(a, m.MSG_CLOSE, b"")
+        msg_type, body = m.recv_msg(b)
+        assert msg_type == m.MSG_CLOSE
+        assert body == b""
+    finally:
+        a.close()
+        b.close()
+
+
+def test_recv_exactly_raises_on_eof():
+    import pytest
+    m = _load_module()
+    a, b = _socket.socketpair()
+    a.close()  # immediately
+    try:
+        with pytest.raises(ConnectionError):
+            m.recv_exactly(b, 10)
+    finally:
+        b.close()

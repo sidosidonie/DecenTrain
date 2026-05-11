@@ -122,6 +122,37 @@ def slalom_verify(
     return ((lhs - rhs) ** 2).mean().item()
 
 
+# ── Wire primitives ─────────────────────────────────────────────────
+class WireProtocolError(RuntimeError):
+    pass
+
+
+def recv_exactly(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes from sock or raise ConnectionError on EOF."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError(f"unexpected EOF after {len(buf)} of {n} bytes")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def send_msg(sock: socket.socket, msg_type: int, body: bytes) -> int:
+    """Send a framed message. Returns total bytes written (header+body)."""
+    header = struct.pack("<II", msg_type, len(body))
+    sock.sendall(header + body)
+    return len(header) + len(body)
+
+
+def recv_msg(sock: socket.socket) -> tuple[int, bytes]:
+    """Read one framed message. Returns (msg_type, body)."""
+    header = recv_exactly(sock, 8)
+    msg_type, body_len = struct.unpack("<II", header)
+    body = recv_exactly(sock, body_len) if body_len else b""
+    return msg_type, body
+
+
 def main() -> int:  # pragma: no cover - filled in last task
     raise NotImplementedError
 
