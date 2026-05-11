@@ -37,3 +37,12 @@ if "torchvision._meta_registrations" not in sys.modules:
 if "flash_attn_2_cuda" not in sys.modules:
     _fa_cuda_stub = types.ModuleType("flash_attn_2_cuda")
     sys.modules["flash_attn_2_cuda"] = _fa_cuda_stub
+
+
+# ---------------------------------------------------------------------------
+# Register custom pytest markers.
+# ---------------------------------------------------------------------------
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "perf: performance tests (gated, run explicitly)"
+    )
