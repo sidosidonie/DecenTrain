@@ -463,3 +463,21 @@ def test_bytes_recv_matches_predicted_within_one_percent():
                 assert rel < 0.01, f"round {r.request_id}: predicted {r.bytes_recv_predicted} got {r.bytes_recv}"
         finally:
             coord.close()
+
+
+def test_compute_rates_for_round():
+    m = _load_module()
+    cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                      wire_dtype=m.DTYPE_FP32)
+    r = m.RoundMetrics(request_id=0,
+                       gpu_forward_t=2.0, wire_recv_t=1.0, cpu_verify_t=4.0,
+                       end_to_end_t=8.0, bytes_recv=49000,
+                       bytes_recv_predicted=49000)
+    rates = m.compute_round_rates(r, cfg, k=m.SLALOM_K)
+    assert rates["wire_mbps"] > 0
+    assert rates["gpu_gflops"] > 0
+    assert rates["verify_gflops"] > 0
+    # Phase breakdown
+    assert 0 <= rates["gpu_pct"] <= 1
+    assert 0 <= rates["wire_pct"] <= 1
+    assert 0 <= rates["verify_pct"] <= 1

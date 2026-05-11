@@ -360,6 +360,32 @@ class RoundMetrics:
     ok: bool = True
 
 
+def compute_round_rates(rm: RoundMetrics, cfg: FFNConfig, k: int) -> dict:
+    """Derived rates and phase breakdown for one round."""
+    B, S, H, I = cfg.batch, cfg.seq, cfg.hidden, cfg.inter
+    ffn_flops = 6 * B * S * H * I  # 3 matmuls × 2 × dims per matmul
+    slalom_flops = 6 * B * S * (H + I) * k
+
+    def _safe(t_ms: float, flops: float, scale: float = 1e9) -> float:
+        return (flops / (t_ms / 1000.0) / scale) if t_ms > 0 else 0.0
+
+    wire_mbps = (rm.bytes_recv / (rm.wire_recv_t / 1000.0) / 1e6) \
+                if rm.wire_recv_t > 0 else 0.0
+    gpu_gflops = _safe(rm.gpu_forward_t, ffn_flops, 1e9)
+    verify_gflops = _safe(rm.cpu_verify_t, slalom_flops, 1e9)
+
+    e2e = rm.end_to_end_t if rm.end_to_end_t > 0 else 1e-9
+    return {
+        "wire_mbps": wire_mbps,
+        "gpu_gflops": gpu_gflops,
+        "verify_gflops": verify_gflops,
+        "gpu_pct": rm.gpu_forward_t / e2e,
+        "wire_pct": rm.wire_recv_t / e2e,
+        "verify_pct": rm.cpu_verify_t / e2e,
+        "sum_pct": (rm.gpu_forward_t + rm.wire_recv_t + rm.cpu_verify_t) / e2e,
+    }
+
+
 # ── Coordinator ─────────────────────────────────────────────────────
 @dataclass
 class FFNConfig:
