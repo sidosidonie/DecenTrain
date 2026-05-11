@@ -452,6 +452,43 @@ def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
     )
 
 
+def write_json_report(path, rounds: list[RoundMetrics], cfg: FFNConfig, *,
+                      warmup: int, k: int = SLALOM_K) -> None:
+    measured = rounds[warmup:] if warmup > 0 else rounds
+    rates = [compute_round_rates(r, cfg, k) for r in measured]
+
+    def _mean(xs):
+        return float(sum(xs) / len(xs)) if xs else 0.0
+
+    mean_e2e_ms = _mean([r.end_to_end_t for r in measured]) or 1e-9
+    summary = {
+        "rounds_total": len(rounds),
+        "rounds_warmup": warmup,
+        "rounds_measured": len(measured),
+        "rounds_passed": sum(1 for r in measured if r.ok),
+        "mean_round_per_s": 1000.0 / mean_e2e_ms,
+        "p50_end_to_end_ms": _percentile([r.end_to_end_t for r in measured], 50),
+        "p95_end_to_end_ms": _percentile([r.end_to_end_t for r in measured], 95),
+        "mean_gpu_forward_ms": _mean([r.gpu_forward_t for r in measured]),
+        "mean_wire_recv_ms": _mean([r.wire_recv_t for r in measured]),
+        "mean_cpu_verify_ms": _mean([r.cpu_verify_t for r in measured]),
+        "mean_wire_mbps": _mean([r["wire_mbps"] for r in rates]),
+        "mean_gpu_gflops": _mean([r["gpu_gflops"] for r in rates]),
+        "mean_verify_gflops": _mean([r["verify_gflops"] for r in rates]),
+        "mean_gpu_pct": _mean([r["gpu_pct"] for r in rates]),
+        "mean_wire_pct": _mean([r["wire_pct"] for r in rates]),
+        "mean_verify_pct": _mean([r["verify_pct"] for r in rates]),
+        "mean_sum_pct": _mean([r["sum_pct"] for r in rates]),
+    }
+    payload = {
+        "config": asdict(cfg),
+        "per_round": [asdict(r) for r in rounds],
+        "summary": summary,
+    }
+    import pathlib as _p
+    _p.Path(path).write_text(json.dumps(payload, indent=2))
+
+
 # ── Coordinator ─────────────────────────────────────────────────────
 @dataclass
 class FFNConfig:

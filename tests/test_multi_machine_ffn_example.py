@@ -505,3 +505,26 @@ def test_format_summary_includes_required_sections():
     ]:
         assert needle in text, f"missing: {needle}"
     assert "rounds passed     8 / 8" in text  # 10 - 2 warmup
+
+
+def test_write_json_report_schema(tmp_path):
+    m = _load_module()
+    cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                      wire_dtype=m.DTYPE_FP32, weight_seed=42)
+    rounds_metrics = [
+        m.RoundMetrics(request_id=i, gpu_forward_t=2.0, wire_recv_t=1.0,
+                       cpu_verify_t=4.0, end_to_end_t=8.0,
+                       bytes_recv=49000, bytes_recv_predicted=49000,
+                       mse_w1=1e-6, mse_w3=1e-6, mse_w2=1e-6, ok=True)
+        for i in range(3)
+    ]
+    out = tmp_path / "report.json"
+    m.write_json_report(out, rounds_metrics, cfg, warmup=1, k=m.SLALOM_K)
+    import json as _json
+    data = _json.loads(out.read_text())
+    assert "config" in data and "per_round" in data and "summary" in data
+    assert len(data["per_round"]) == 3
+    assert "mean_round_per_s" in data["summary"]
+    assert "p95_end_to_end_ms" in data["summary"]
+    assert "mean_wire_mbps" in data["summary"]
+    assert "rounds_passed" in data["summary"]
