@@ -386,6 +386,72 @@ def compute_round_rates(rm: RoundMetrics, cfg: FFNConfig, k: int) -> dict:
     }
 
 
+def _percentile(xs: list[float], q: float) -> float:
+    if not xs:
+        return 0.0
+    return float(np.percentile(xs, q))
+
+
+def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
+                    warmup: int, k: int = SLALOM_K) -> str:
+    measured = rounds[warmup:] if warmup > 0 else rounds
+    if not measured:
+        return "(no rounds measured after warmup)"
+    e2e = [r.end_to_end_t for r in measured]
+    gpu = [r.gpu_forward_t for r in measured]
+    wire = [r.wire_recv_t for r in measured]
+    verify = [r.cpu_verify_t for r in measured]
+    rates = [compute_round_rates(r, cfg, k) for r in measured]
+    passed = sum(1 for r in measured if r.ok)
+    tokens_per_round = cfg.batch * cfg.seq
+    mean_e2e_s = (sum(e2e) / len(e2e)) / 1000.0
+
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else 0.0
+
+    bytes_recv_mb = _mean([r.bytes_recv for r in measured]) / 1e6
+    bytes_pred_mb = _mean([r.bytes_recv_predicted for r in measured]) / 1e6
+
+    return (
+        "=== Multi-Machine FFN Example: "
+        f"{len(rounds)} rounds (warmup={warmup}) ===\n\n"
+        "Config:\n"
+        f"  FFN:      SwiGLU  hidden={cfg.hidden}  inter={cfg.inter}  "
+        f"dtype={_DTYPE_NAME[cfg.wire_dtype]}  batch×seq={cfg.batch}×{cfg.seq}\n"
+        f"  Verify:   SLALOM  k={k}\n\n"
+        "End-to-end (ms):\n"
+        f"  p50   {_percentile(e2e, 50):.2f}   "
+        f"p95   {_percentile(e2e, 95):.2f}   "
+        f"mean  {_mean(e2e):.2f}\n"
+        f"  Throughput        {1.0/mean_e2e_s:.2f} round/s   "
+        f"({tokens_per_round/mean_e2e_s:.1f} tokens/s)\n\n"
+        "Phase timings (ms, mean):\n"
+        f"  GPU forward       {_mean(gpu):.2f}\n"
+        f"  Wire recv         {_mean(wire):.2f}\n"
+        f"  CPU SLALOM        {_mean(verify):.2f}     "
+        f"(w1={_mean([r.cpu_verify_w1_t for r in measured]):.2f}  "
+        f"w3={_mean([r.cpu_verify_w3_t for r in measured]):.2f}  "
+        f"w2={_mean([r.cpu_verify_w2_t for r in measured]):.2f})\n\n"
+        "Phase breakdown (% of end-to-end, mean):\n"
+        f"  gpu_pct           {_mean([r['gpu_pct'] for r in rates])*100:.1f}%\n"
+        f"  wire_pct          {_mean([r['wire_pct'] for r in rates])*100:.1f}%\n"
+        f"  verify_pct        {_mean([r['verify_pct'] for r in rates])*100:.1f}%\n"
+        f"  sum_pct           {_mean([r['sum_pct'] for r in rates])*100:.1f}%\n\n"
+        "Rate breakdown:\n"
+        f"  Wire throughput   {_mean([r['wire_mbps'] for r in rates]):.1f} MB/s\n"
+        f"  GPU compute       {_mean([r['gpu_gflops'] for r in rates])/1000.0:.2f} TFLOPS\n"
+        f"  CPU SLALOM        {_mean([r['verify_gflops'] for r in rates]):.2f} GFLOPS\n\n"
+        "Wire bytes (per round):\n"
+        f"  Predicted         {bytes_pred_mb:.2f} MB\n"
+        f"  Measured          {bytes_recv_mb:.2f} MB\n\n"
+        "Verification:\n"
+        f"  rounds passed     {passed} / {len(measured)}\n"
+        f"  mse_w1 p95        {_percentile([r.mse_w1 for r in measured], 95):.2e}\n"
+        f"  mse_w3 p95        {_percentile([r.mse_w3 for r in measured], 95):.2e}\n"
+        f"  mse_w2 p95        {_percentile([r.mse_w2 for r in measured], 95):.2e}\n"
+    )
+
+
 # ── Coordinator ─────────────────────────────────────────────────────
 @dataclass
 class FFNConfig:

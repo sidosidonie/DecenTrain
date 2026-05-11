@@ -481,3 +481,27 @@ def test_compute_rates_for_round():
     assert 0 <= rates["gpu_pct"] <= 1
     assert 0 <= rates["wire_pct"] <= 1
     assert 0 <= rates["verify_pct"] <= 1
+
+
+def test_format_summary_includes_required_sections():
+    m = _load_module()
+    cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                      wire_dtype=m.DTYPE_FP32, weight_seed=42)
+    rounds_metrics = [
+        m.RoundMetrics(request_id=i, gpu_forward_t=2.0, wire_recv_t=1.0,
+                       cpu_verify_t=4.0, end_to_end_t=8.0,
+                       bytes_recv=49000, bytes_recv_predicted=49000,
+                       mse_w1=1e-6, mse_w3=1e-6, mse_w2=1e-6, ok=True)
+        for i in range(10)
+    ]
+    text = m.format_summary(rounds_metrics, cfg, warmup=2, k=m.SLALOM_K)
+    for needle in [
+        "Multi-Machine FFN Example",
+        "Phase timings",
+        "Phase breakdown",
+        "Rate breakdown",
+        "Verification:",
+        "Wire bytes",
+    ]:
+        assert needle in text, f"missing: {needle}"
+    assert "rounds passed     8 / 8" in text  # 10 - 2 warmup
