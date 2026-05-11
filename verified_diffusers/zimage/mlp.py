@@ -4,10 +4,17 @@ Verified Z-Image feedforward (SwiGLU MLP) with CPU verification chain.
 GPU runs complete forward: w1(x), w3(x), silu(w1) * w3, w2(gated).
 CPU asynchronously verifies all 3 linear projections via SLALOM and
 recomputes silu + elementwise multiply from verified chain data.
+
+The MLP input is read from runtime.cpu_state[input_state_key]. If the
+caller does not provide a key (single-process tests), forward() seeds
+the default key via D2H of x. The multi-machine coordinator always
+passes an explicit key populated from CPU recompute, so x is never
+shipped over the wire.
 """
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -27,7 +34,12 @@ class VerifiedZImageFeedForward(nn.Module):
         self.w3 = VerifyLinearModule(feed_forward.w3, runtime, f"{tag_prefix}.w3")
         self.tag_prefix = tag_prefix
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        input_state_key: Optional[str] = None,
+    ) -> torch.Tensor:
         # ──── GPU Forward (complete, non-blocking) ───────────────────
 
         w1_raw = self.w1.forward_gpu_only(x)
@@ -38,17 +50,20 @@ class VerifiedZImageFeedForward(nn.Module):
         # ──── Submit async chain verification ────────────────────────
 
         if self.runtime.config.enabled:
-            self._submit_chain(x, w1_raw, w3_raw, w2_raw)
+            resolved_key = input_state_key or f"{self.tag_prefix}.input"
+            if input_state_key is None:
+                x_cpu, x_evt = self.runtime.d2h_async(x)
+                self.runtime.cpu_state_set_d2h(resolved_key, x_cpu, x_evt)
+            self._submit_chain(resolved_key, x, w1_raw, w3_raw, w2_raw)
 
         return w2_raw
 
-    def _submit_chain(self, x, w1_raw, w3_raw, w2_raw):
+    def _submit_chain(self, input_state_key, x, w1_raw, w3_raw, w2_raw):
         rt = self.runtime
         if not rt.should_verify_now():
             return
 
         d2h = rt.d2h_async
-        x_h, x_e = d2h(x)
         w1_h, w1_e = d2h(w1_raw)
         w3_h, w3_e = d2h(w3_raw)
         w2_h, w2_e = d2h(w2_raw)
@@ -64,12 +79,12 @@ class VerifiedZImageFeedForward(nn.Module):
         _gpu_refs = [x, w1_raw, w3_raw, w2_raw]
 
         def _chain():
-            for evt in [x_e, w1_e, w3_e, w2_e]:
+            for evt in [w1_e, w3_e, w2_e]:
                 if evt is not None:
                     evt.synchronize()
             _gpu_refs.clear()
 
-            x_cpu = x_h.float()
+            x_cpu = rt.cpu_state_get(input_state_key).float()
 
             def _slalom(tag, x_in, y_out, s, st):
                 t0 = time.perf_counter()

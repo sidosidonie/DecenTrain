@@ -5,6 +5,12 @@ GPU runs the complete attention forward. CPU asynchronously verifies:
   - Q/K/V/O projections via SLALOM (D2H output only)
   - Q@K^T and P@V via Freivalds (D2H output only, inputs from CPU chain)
   - Non-linears (norm_q/k, RoPE, softmax) recomputed on CPU
+
+The chain input is read from runtime.cpu_state[input_state_key]. If the
+caller does not provide a key (single-process tests), forward() seeds
+the default key via D2H of hidden_states. The multi-machine coordinator
+always passes an explicit key populated from CPU recompute, so the
+attention input is never shipped over the wire.
 """
 from __future__ import annotations
 
@@ -63,6 +69,8 @@ class VerifiedZImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[torch.Tensor] = None,
+        *,
+        input_state_key: Optional[str] = None,
     ) -> torch.Tensor:
         # ──── GPU Forward (complete, non-blocking) ───────────────────
 
@@ -112,8 +120,18 @@ class VerifiedZImageAttention(nn.Module):
         # ──── Submit async chain verification ────────────────────────
 
         if self.runtime.config.enabled:
+            # Resolve the cpu_state key holding the chain input. If the caller
+            # didn't pre-populate one, fall back to a D2H of hidden_states and
+            # seed the default key ourselves — this keeps single-process tests
+            # working while the multi-machine path always passes an explicit
+            # key (and never triggers the input D2H).
+            resolved_key = input_state_key or f"{self.tag_prefix}.input"
+            if input_state_key is None:
+                x_cpu, x_evt = self.runtime.d2h_async(hidden_states)
+                self.runtime.cpu_state_set_d2h(resolved_key, x_cpu, x_evt)
+
             self._submit_chain(
-                hidden_states, q_raw, k_raw, v_raw,
+                resolved_key, hidden_states, q_raw, k_raw, v_raw,
                 scores, attn_out, o_raw,
                 freqs_cis, attention_mask,
             )
@@ -121,7 +139,7 @@ class VerifiedZImageAttention(nn.Module):
         return output
 
     def _submit_chain(
-        self, hidden_states, q_raw, k_raw, v_raw,
+        self, input_state_key, hidden_states, q_raw, k_raw, v_raw,
         scores, attn_out_flat, o_raw,
         freqs_cis, attention_mask,
     ):
@@ -130,7 +148,6 @@ class VerifiedZImageAttention(nn.Module):
             return
 
         d2h = rt.d2h_async
-        x_h, x_e = d2h(hidden_states)
         q_h, q_e = d2h(q_raw)
         k_h, k_e = d2h(k_raw)
         v_h, v_e = d2h(v_raw)
@@ -166,11 +183,11 @@ class VerifiedZImageAttention(nn.Module):
 
         def _linear_checks():
             """Verify Q/K/V/O projections via SLALOM (fast, O(n*k))."""
-            for evt in [x_e, q_e, k_e, v_e, ao_e, o_e]:
+            for evt in [q_e, k_e, v_e, ao_e, o_e]:
                 if evt is not None:
                     evt.synchronize()
 
-            x = x_h.float()
+            x = rt.cpu_state_get(input_state_key).float()
 
             def _slalom(tag, x_in, y_out, s, st):
                 t0 = time.perf_counter()
