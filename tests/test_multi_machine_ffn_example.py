@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+from typing import Optional
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -181,3 +182,81 @@ def test_pack_unpack_forward_done():
     out = m.unpack_forward_done(body)
     assert out["request_id"] == 5
     assert abs(out["gpu_forward_t_ms"] - 12.345) < 1e-9
+
+
+import subprocess
+import time as _time
+import sys as _sys
+
+
+def _pick_free_port() -> int:
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _wait_port(port: int, host: str = "127.0.0.1", timeout: float = 10.0) -> None:
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        try:
+            with _socket.create_connection((host, port), timeout=0.5):
+                return
+        except (ConnectionRefusedError, OSError):
+            _time.sleep(0.05)
+    raise TimeoutError(f"worker port {port} did not open within {timeout}s")
+
+
+class _WorkerProc:
+    """Context manager that spawns a worker subprocess on a free port."""
+
+    def __init__(self, **cli):
+        self.cli = cli
+        self.port = _pick_free_port()
+        self.proc: Optional[subprocess.Popen] = None
+
+    def __enter__(self):
+        cmd = [_sys.executable, str(EXAMPLE_PATH),
+               "--role", "worker",
+               "--bind", f"127.0.0.1:{self.port}",
+               "--device", "cpu"]  # tests default to CPU for portability
+        for k, v in self.cli.items():
+            cmd.extend([f"--{k.replace('_', '-')}", str(v)])
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        try:
+            _wait_port(self.port)
+        except TimeoutError:
+            self.proc.terminate()
+            out, err = self.proc.communicate(timeout=2)
+            raise RuntimeError(
+                f"worker did not start. stdout={out!r} stderr={err!r}"
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+def test_worker_handles_load_and_close():
+    """Bring up worker, send LOAD_REQ, get LOAD_ACK, send CLOSE, worker exits."""
+    m = _load_module()
+    with _WorkerProc() as wp:
+        with _socket.create_connection(("127.0.0.1", wp.port)) as sock:
+            m.send_msg(sock, m.MSG_LOAD_REQ,
+                       m.pack_load_req(hidden=8, inter=16,
+                                        weight_seed=42, dtype_id=m.DTYPE_FP32))
+            mt, body = m.recv_msg(sock)
+            assert mt == m.MSG_LOAD_ACK
+            assert m.unpack_load_ack(body)["status"] == 0
+            m.send_msg(sock, m.MSG_CLOSE, b"")
+        # worker should exit cleanly within 3s
+        rc = wp.proc.wait(timeout=3)
+        assert rc == 0, f"worker exited with {rc}"

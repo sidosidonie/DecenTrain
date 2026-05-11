@@ -217,8 +217,98 @@ def unpack_forward_done(body: bytes) -> dict:
     return {"request_id": request_id, "gpu_forward_t_ms": gpu_forward_t_ms}
 
 
-def main() -> int:  # pragma: no cover - filled in last task
-    raise NotImplementedError
+# ── Worker ──────────────────────────────────────────────────────────
+class Worker:
+    """Untrusted GPU host. Serves one coordinator at a time."""
+
+    def __init__(self, bind_host: str, bind_port: int, device: str,
+                 inject_fault: str = "none"):
+        self.bind_host = bind_host
+        self.bind_port = bind_port
+        self.device = torch.device(device)
+        self.inject_fault = inject_fault
+        self.w1: Optional[nn.Linear] = None
+        self.w2: Optional[nn.Linear] = None
+        self.w3: Optional[nn.Linear] = None
+        self.hidden = 0
+        self.inter = 0
+        self.wire_dtype_id = DTYPE_FP16
+        self.compute_dtype: torch.dtype = torch.float16
+
+    def serve_once(self) -> None:
+        """Accept one real coordinator, serve until CLOSE or disconnect.
+
+        Ignores empty probe connections (e.g. liveness checks from launchers
+        / tests) that connect and immediately disconnect without sending any
+        bytes — keeps accepting until a session actually transmits a message.
+        """
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((self.bind_host, self.bind_port))
+        srv.listen(8)
+        try:
+            while True:
+                sock, _addr = srv.accept()
+                try:
+                    handled = self._serve_session(sock)
+                finally:
+                    sock.close()
+                if handled:
+                    return
+        finally:
+            srv.close()
+
+    def _serve_session(self, sock: socket.socket) -> bool:
+        """Run one session. Returns True if any message was processed."""
+        handled = False
+        while True:
+            try:
+                msg_type, body = recv_msg(sock)
+            except (ConnectionError, OSError):
+                return handled
+            handled = True
+            if msg_type == MSG_LOAD_REQ:
+                fields = unpack_load_req(body)
+                self._handle_load(sock, fields)
+            elif msg_type == MSG_CLOSE:
+                return handled
+            elif msg_type == MSG_FORWARD_REQ:
+                fields = unpack_forward_req(body)
+                self._handle_forward(sock, fields)
+            else:
+                raise WireProtocolError(f"unexpected msg_type {msg_type} on worker")
+
+    def _handle_load(self, sock: socket.socket, fields: dict) -> None:
+        self.hidden = fields["hidden"]
+        self.inter = fields["inter"]
+        self.wire_dtype_id = fields["dtype_id"]
+        self.compute_dtype = _TORCH_DTYPE[self.wire_dtype_id]
+        self.w1, self.w2, self.w3 = make_weights(
+            self.hidden, self.inter, fields["weight_seed"],
+            dtype=self.compute_dtype, device=self.device,
+        )
+        send_msg(sock, MSG_LOAD_ACK, pack_load_ack(0))
+
+    def _handle_forward(self, sock: socket.socket, fields: dict) -> None:
+        raise NotImplementedError("forward implemented in Task 7")
+
+
+# ── Main (incremental — full CLI in last task) ──────────────────────
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--role", choices=["loopback", "worker", "coordinator"],
+                   default="loopback")
+    p.add_argument("--bind", default="127.0.0.1:9100")
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--inject-fault", default="none",
+                   choices=["none", "flip_y1", "scale_y2", "drop_silu"])
+    args, _unknown = p.parse_known_args()
+
+    if args.role == "worker":
+        host, port_s = args.bind.split(":")
+        Worker(host, int(port_s), args.device, args.inject_fault).serve_once()
+        return 0
+    raise NotImplementedError(f"role={args.role} not yet implemented")
 
 
 if __name__ == "__main__":
