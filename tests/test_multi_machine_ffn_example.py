@@ -528,3 +528,22 @@ def test_write_json_report_schema(tmp_path):
     assert "p95_end_to_end_ms" in data["summary"]
     assert "mean_wire_mbps" in data["summary"]
     assert "rounds_passed" in data["summary"]
+
+
+def test_loopback_role_runs_end_to_end(tmp_path):
+    """`--role loopback` spawns its own worker and runs N rounds clean."""
+    json_path = tmp_path / "r.json"
+    cmd = [_sys.executable, str(EXAMPLE_PATH),
+           "--role", "loopback",
+           "--rounds", "5", "--warmup", "1",
+           "--hidden", "8", "--inter", "16",
+           "--batch", "1", "--seq", "4",
+           "--wire-dtype", "fp32",
+           "--device", "cpu",
+           "--json-report", str(json_path)]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, f"stderr={res.stderr}\nstdout={res.stdout}"
+    assert "Multi-Machine FFN Example" in res.stdout
+    import json as _json
+    data = _json.loads(json_path.read_text())
+    assert data["summary"]["rounds_passed"] == 4  # 5 - 1 warmup

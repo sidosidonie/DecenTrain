@@ -640,22 +640,111 @@ class Coordinator:
         return [self.run_round(i, input_seed_start + i) for i in range(rounds)]
 
 
-# ── Main (incremental — full CLI in last task) ──────────────────────
+# ── Loopback launcher ───────────────────────────────────────────────
+def _pick_free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _wait_port(port: int, host: str = "127.0.0.1", timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.05)
+    raise TimeoutError(f"worker port {port} did not open within {timeout}s")
+
+
+def run_coordinator(host: str, port: int, args) -> int:
+    cfg = FFNConfig(
+        hidden=args.hidden, inter=args.inter,
+        batch=args.batch, seq=args.seq,
+        wire_dtype=_NAME_TO_DTYPE[args.wire_dtype],
+        weight_seed=args.weight_seed,
+    )
+    coord = Coordinator(host=host, port=port, config=cfg,
+                         threshold=args.threshold, k=SLALOM_K)
+    try:
+        coord.connect_and_load()
+        rounds = coord.run_many(rounds=args.rounds)
+    finally:
+        coord.close()
+    print(format_summary(rounds, cfg, warmup=args.warmup, k=SLALOM_K))
+    if args.json_report:
+        write_json_report(args.json_report, rounds, cfg,
+                          warmup=args.warmup, k=SLALOM_K)
+    if args.verbose:
+        for r in rounds:
+            print(f"r={r.request_id} e2e={r.end_to_end_t:.2f} "
+                  f"gpu={r.gpu_forward_t:.2f} wire={r.wire_recv_t:.2f} "
+                  f"verify={r.cpu_verify_t:.2f} "
+                  f"mse={r.mse_w1:.2e}/{r.mse_w3:.2e}/{r.mse_w2:.2e} "
+                  f"ok={r.ok}")
+    return 0
+
+
+def launch_loopback(args) -> int:
+    port = _pick_free_port()
+    worker_cmd = [
+        sys.executable, __file__,
+        "--role", "worker",
+        "--bind", f"127.0.0.1:{port}",
+        "--device", args.device,
+        "--inject-fault", args.inject_fault,
+    ]
+    proc = subprocess.Popen(worker_cmd, stderr=subprocess.PIPE)
+    try:
+        _wait_port(port)
+        return run_coordinator("127.0.0.1", port, args)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if proc.returncode and proc.returncode != 0:
+            err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+            sys.stderr.write(f"worker exited with {proc.returncode}\n{err}\n")
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--role", choices=["loopback", "worker", "coordinator"],
                    default="loopback")
     p.add_argument("--bind", default="127.0.0.1:9100")
+    p.add_argument("--worker-host", default="127.0.0.1")
+    p.add_argument("--worker-port", type=int, default=9100)
+    p.add_argument("--rounds", type=int, default=100)
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--hidden", type=int, default=4096)
+    p.add_argument("--inter", type=int, default=11008)
+    p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--seq", type=int, default=512)
+    p.add_argument("--wire-dtype", choices=["fp16", "fp32"], default="fp16")
+    p.add_argument("--weight-seed", type=lambda s: int(s, 0), default=0xC0FFEE)
+    p.add_argument("--threshold", type=float, default=1e-3)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--inject-fault", default="none",
                    choices=["none", "flip_y1", "scale_y2", "drop_silu"])
-    args, _unknown = p.parse_known_args()
+    p.add_argument("--json-report", default=None)
+    p.add_argument("--verbose", action="store_true")
+    args = p.parse_args()
 
     if args.role == "worker":
         host, port_s = args.bind.split(":")
         Worker(host, int(port_s), args.device, args.inject_fault).serve_once()
         return 0
-    raise NotImplementedError(f"role={args.role} not yet implemented")
+    if args.role == "coordinator":
+        return run_coordinator(args.worker_host, args.worker_port, args)
+    if args.role == "loopback":
+        return launch_loopback(args)
+    raise ValueError(f"unknown role: {args.role}")
 
 
 if __name__ == "__main__":
