@@ -689,6 +689,21 @@ def _wait_port(port: int, host: str = "127.0.0.1", timeout: float = 10.0) -> Non
     raise TimeoutError(f"worker port {port} did not open within {timeout}s")
 
 
+def default_threshold(wire_dtype_id: int, inter: int) -> float:
+    """Pick an MSE threshold above the wire's numeric noise floor.
+
+    fp32 wire round-trips exactly, so its noise floor is ~1e-15 — 1e-3 is
+    plenty. fp16 wire quantizes each activation; that error, summed over
+    `inter` (and `hidden`) in the SLALOM projection, grows roughly linearly
+    with the dims, landing around 2-4e-3 at inter=11008. Scale with `inter`
+    so larger models still pass clean while forged outputs (orders of
+    magnitude above the floor) still fail.
+    """
+    if wire_dtype_id == DTYPE_FP32:
+        return 1e-3
+    return max(1e-3, inter * 2e-6)  # fp16
+
+
 def run_coordinator(host: str, port: int, args) -> int:
     cfg = FFNConfig(
         hidden=args.hidden, inter=args.inter,
@@ -696,8 +711,11 @@ def run_coordinator(host: str, port: int, args) -> int:
         wire_dtype=_NAME_TO_DTYPE[args.wire_dtype],
         weight_seed=args.weight_seed,
     )
+    threshold = args.threshold
+    if threshold is None:
+        threshold = default_threshold(cfg.wire_dtype, cfg.inter)
     coord = Coordinator(host=host, port=port, config=cfg,
-                         threshold=args.threshold, k=SLALOM_K)
+                         threshold=threshold, k=SLALOM_K)
     try:
         coord.connect_and_load()
         rounds = coord.run_many(rounds=args.rounds)
@@ -767,7 +785,9 @@ def main() -> int:
     p.add_argument("--seq", type=int, default=512)
     p.add_argument("--wire-dtype", choices=["fp16", "fp32"], default="fp16")
     p.add_argument("--weight-seed", type=lambda s: int(s, 0), default=0xC0FFEE)
-    p.add_argument("--threshold", type=float, default=1e-3)
+    p.add_argument("--threshold", type=float, default=None,
+                   help="SLALOM MSE threshold; default scales with wire dtype "
+                        "and dims (1e-3 for fp32, ~inter*2e-6 for fp16)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--inject-fault", default="none",
                    choices=["none", "flip_y1", "scale_y2", "drop_silu"])
