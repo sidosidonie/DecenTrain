@@ -336,6 +336,66 @@ class Worker:
         raise ValueError(f"unknown inject_fault: {self.inject_fault}")
 
 
+# ── Coordinator ─────────────────────────────────────────────────────
+@dataclass
+class FFNConfig:
+    hidden: int
+    inter: int
+    batch: int
+    seq: int
+    wire_dtype: int = DTYPE_FP16
+    weight_seed: int = 0xC0FFEE
+
+
+class Coordinator:
+    """Trusted host. Owns SLALOM state and verifies every linear output."""
+
+    def __init__(self, host: str, port: int, config: FFNConfig,
+                 threshold: float = 1e-3, k: int = SLALOM_K):
+        self.host = host
+        self.port = port
+        self.config = config
+        self.threshold = threshold
+        self.k = k
+        # CPU-side fp32 copy of weights (used for s_tilde precompute)
+        self.w1, self.w2, self.w3 = make_weights(
+            config.hidden, config.inter, config.weight_seed,
+            dtype=torch.float32, device="cpu",
+        )
+        # Three independent SLALOM projection vectors (one per layer).
+        # Fixed seed so verification is reproducible across runs.
+        self.s_w1 = make_s(config.inter, k, seed=S_GENERATOR_SEED + 1)
+        self.s_w3 = make_s(config.inter, k, seed=S_GENERATOR_SEED + 2)
+        self.s_w2 = make_s(config.hidden, k, seed=S_GENERATOR_SEED + 3)
+        self.s_tilde_w1 = precompute_s_tilde(self.w1.weight, self.s_w1)
+        self.s_tilde_w3 = precompute_s_tilde(self.w3.weight, self.s_w3)
+        self.s_tilde_w2 = precompute_s_tilde(self.w2.weight, self.s_w2)
+
+        self.sock: Optional[socket.socket] = None
+        self.pool = ThreadPoolExecutor(max_workers=2)
+
+    def connect_and_load(self) -> None:
+        self.sock = socket.create_connection((self.host, self.port), timeout=30)
+        send_msg(self.sock, MSG_LOAD_REQ,
+                 pack_load_req(self.config.hidden, self.config.inter,
+                                self.config.weight_seed, self.config.wire_dtype))
+        mt, body = recv_msg(self.sock)
+        if mt != MSG_LOAD_ACK:
+            raise WireProtocolError(f"expected LOAD_ACK, got {mt}")
+        if unpack_load_ack(body)["status"] != 0:
+            raise RuntimeError("worker LOAD failed")
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                send_msg(self.sock, MSG_CLOSE, b"")
+            except OSError:
+                pass
+            self.sock.close()
+            self.sock = None
+        self.pool.shutdown(wait=False)
+
+
 # ── Main (incremental — full CLI in last task) ──────────────────────
 def main() -> int:
     p = argparse.ArgumentParser()

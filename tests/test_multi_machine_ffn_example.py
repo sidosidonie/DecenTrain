@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import sys
 from typing import Optional
 
 
@@ -13,6 +14,10 @@ EXAMPLE_PATH = REPO_ROOT / "examples" / "multi_machine_ffn.py"
 def _load_module():
     spec = importlib.util.spec_from_file_location("mmffn", EXAMPLE_PATH)
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec_module so that `from __future__ import annotations`
+    # dataclasses can resolve string annotations against the module's own ns
+    # (dataclass internals look up cls.__module__ in sys.modules).
+    sys.modules["mmffn"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -371,3 +376,22 @@ def test_fault_drop_silu_changes_y2_via_chain():
         assert torch.allclose(bad_acts[m.OP_W3], clean_acts[m.OP_W3])
         # but y2 differs because gated was computed without SiLU
         assert not torch.allclose(bad_acts[m.OP_W2], clean_acts[m.OP_W2])
+
+
+def test_coordinator_connect_loads_weights_and_builds_slalom():
+    m = _load_module()
+    with _WorkerProc() as wp:
+        cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                          wire_dtype=m.DTYPE_FP32, weight_seed=42)
+        coord = m.Coordinator(host="127.0.0.1", port=wp.port, config=cfg,
+                              threshold=1e-3)
+        try:
+            coord.connect_and_load()
+            # Coordinator owns CPU-side weights and SLALOM state
+            assert coord.w1.weight.shape == (16, 8)
+            assert coord.s_w1.shape == (16, m.SLALOM_K)
+            assert coord.s_tilde_w1.shape == (8, m.SLALOM_K)
+            assert coord.s_w2.shape == (8, m.SLALOM_K)
+            assert coord.s_tilde_w2.shape == (16, m.SLALOM_K)
+        finally:
+            coord.close()
