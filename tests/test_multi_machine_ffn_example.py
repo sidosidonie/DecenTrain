@@ -429,3 +429,37 @@ def test_coordinator_run_round_with_flip_y1_caught():
             assert rm.mse_w1 > 1e-3
         finally:
             coord.close()
+
+
+def test_coordinator_run_many_rounds_collects_metrics():
+    m = _load_module()
+    with _WorkerProc() as wp:
+        cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                          wire_dtype=m.DTYPE_FP32, weight_seed=42)
+        coord = m.Coordinator(host="127.0.0.1", port=wp.port, config=cfg,
+                              threshold=1e-3)
+        try:
+            coord.connect_and_load()
+            ms = coord.run_many(rounds=5)
+            assert len(ms) == 5
+            assert all(r.ok for r in ms)
+            assert all(r.bytes_recv > 0 for r in ms)
+        finally:
+            coord.close()
+
+
+def test_bytes_recv_matches_predicted_within_one_percent():
+    m = _load_module()
+    with _WorkerProc() as wp:
+        cfg = m.FFNConfig(hidden=8, inter=16, batch=1, seq=4,
+                          wire_dtype=m.DTYPE_FP32, weight_seed=42)
+        coord = m.Coordinator(host="127.0.0.1", port=wp.port, config=cfg,
+                              threshold=1e-3)
+        try:
+            coord.connect_and_load()
+            ms = coord.run_many(rounds=3)
+            for r in ms:
+                rel = abs(r.bytes_recv - r.bytes_recv_predicted) / r.bytes_recv_predicted
+                assert rel < 0.01, f"round {r.request_id}: predicted {r.bytes_recv_predicted} got {r.bytes_recv}"
+        finally:
+            coord.close()

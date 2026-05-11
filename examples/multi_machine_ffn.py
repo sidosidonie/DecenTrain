@@ -507,6 +507,9 @@ class Coordinator:
                  and rm.mse_w2 <= self.threshold)
         return rm
 
+    def run_many(self, rounds: int, *, input_seed_start: int = 1_000_000) -> list[RoundMetrics]:
+        return [self.run_round(i, input_seed_start + i) for i in range(rounds)]
+
 
 # ── Main (incremental — full CLI in last task) ──────────────────────
 def main() -> int:
