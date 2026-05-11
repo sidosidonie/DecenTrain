@@ -290,7 +290,40 @@ class Worker:
         send_msg(sock, MSG_LOAD_ACK, pack_load_ack(0))
 
     def _handle_forward(self, sock: socket.socket, fields: dict) -> None:
-        raise NotImplementedError("forward implemented in Task 7")
+        request_id = fields["request_id"]
+        input_seed = fields["input_seed"]
+        batch = fields["batch"]
+        seq = fields["seq"]
+
+        # Deterministic input reproduction. Same recipe runs on coordinator.
+        gen = torch.Generator(device="cpu").manual_seed(input_seed)
+        x_cpu = torch.randn(batch, seq, self.hidden,
+                             dtype=torch.float32, generator=gen)
+        x = x_cpu.to(device=self.device, dtype=self.compute_dtype)
+
+        t0 = time.perf_counter()
+        y1 = self.w1(x)
+        y3 = self.w3(x)
+        gated = F.silu(y1) * y3
+        y2 = self.w2(gated)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        gpu_t_ms = (time.perf_counter() - t0) * 1000.0
+
+        y1, y3, y2 = self._apply_fault(y1, y3, y2, gated)
+
+        send_msg(sock, MSG_ACTIVATION,
+                 pack_activation(request_id, OP_W1, y1, self.wire_dtype_id))
+        send_msg(sock, MSG_ACTIVATION,
+                 pack_activation(request_id, OP_W3, y3, self.wire_dtype_id))
+        send_msg(sock, MSG_ACTIVATION,
+                 pack_activation(request_id, OP_W2, y2, self.wire_dtype_id))
+        send_msg(sock, MSG_FORWARD_DONE,
+                 pack_forward_done(request_id, gpu_t_ms))
+
+    def _apply_fault(self, y1, y3, y2, gated):
+        """No-op for inject_fault='none'; overridden in Task 8."""
+        return y1, y3, y2
 
 
 # ── Main (incremental — full CLI in last task) ──────────────────────

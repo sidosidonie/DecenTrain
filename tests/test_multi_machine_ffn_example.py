@@ -33,6 +33,7 @@ def test_module_imports_and_exposes_constants():
 
 
 import torch
+import torch.nn.functional as F
 
 
 def test_make_weights_deterministic():
@@ -260,3 +261,54 @@ def test_worker_handles_load_and_close():
         # worker should exit cleanly within 3s
         rc = wp.proc.wait(timeout=3)
         assert rc == 0, f"worker exited with {rc}"
+
+
+def _reproduce_input(seed: int, batch: int, seq: int, hidden: int,
+                     dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    return torch.randn(batch, seq, hidden, dtype=torch.float32, generator=gen).to(dtype)
+
+
+def test_worker_forward_produces_correct_outputs():
+    m = _load_module()
+    with _WorkerProc() as wp:
+        with _socket.create_connection(("127.0.0.1", wp.port)) as sock:
+            m.send_msg(sock, m.MSG_LOAD_REQ,
+                       m.pack_load_req(hidden=8, inter=16,
+                                        weight_seed=42, dtype_id=m.DTYPE_FP32))
+            mt, _ = m.recv_msg(sock)
+            assert mt == m.MSG_LOAD_ACK
+
+            m.send_msg(sock, m.MSG_FORWARD_REQ,
+                       m.pack_forward_req(request_id=1, input_seed=99,
+                                           batch=1, seq=4))
+            # Expect 3 ACTIVATION + 1 FORWARD_DONE
+            received = []
+            for _ in range(4):
+                mt, body = m.recv_msg(sock)
+                received.append((mt, body))
+            m.send_msg(sock, m.MSG_CLOSE, b"")
+
+        acts = [b for (t, b) in received if t == m.MSG_ACTIVATION]
+        dones = [b for (t, b) in received if t == m.MSG_FORWARD_DONE]
+        assert len(acts) == 3 and len(dones) == 1
+
+        # Reproduce expected outputs from same seed + same weights on CPU
+        w1, w2, w3 = m.make_weights(hidden=8, inter=16, seed=42,
+                                     dtype=torch.float32, device="cpu")
+        x = _reproduce_input(seed=99, batch=1, seq=4, hidden=8)
+        y1_expected = w1(x)
+        y3_expected = w3(x)
+        y2_expected = w2(F.silu(y1_expected) * y3_expected)
+
+        by_tag = {}
+        for body in acts:
+            d = m.unpack_activation(body)
+            by_tag[d["op_tag"]] = d["tensor"]
+        assert torch.allclose(by_tag[m.OP_W1], y1_expected, atol=1e-4)
+        assert torch.allclose(by_tag[m.OP_W3], y3_expected, atol=1e-4)
+        assert torch.allclose(by_tag[m.OP_W2], y2_expected, atol=1e-4)
+
+        done = m.unpack_forward_done(dones[0])
+        assert done["request_id"] == 1
+        assert done["gpu_forward_t_ms"] > 0
