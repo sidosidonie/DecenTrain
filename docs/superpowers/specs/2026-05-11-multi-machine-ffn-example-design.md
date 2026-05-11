@@ -294,19 +294,74 @@ similar value).
 @dataclass
 class RoundMetrics:
     request_id: int
-    coord_send_t: float          # ms, time-on-wire from FORWARD_REQ to first ACTIVATION
-    gpu_forward_t: float         # ms, worker-reported
-    wire_recv_t: float           # ms, recv of 3 ACTIVATION + FORWARD_DONE
-    cpu_verify_t: float          # ms, parallel max(w1,w3) + sequential w2
-    end_to_end_t: float          # ms, FORWARD_REQ send → SLALOM w2 done
+    # Phase timings (ms)
+    coord_send_t: float          # FORWARD_REQ send → first ACTIVATION byte received
+    gpu_forward_t: float         # worker-reported, includes torch.cuda.synchronize
+    wire_recv_t: float           # recv of 3 ACTIVATION + FORWARD_DONE
+    cpu_verify_t: float          # parallel max(w1,w3) + sequential w2 wallclock
+    cpu_verify_w1_t: float       # individual SLALOM timings (for breakdown)
+    cpu_verify_w3_t: float
+    cpu_verify_w2_t: float
+    end_to_end_t: float          # FORWARD_REQ send → SLALOM w2 done
+    # Bytes
     bytes_sent: int
     bytes_recv: int
     bytes_recv_predicted: int
+    # Verification
     mse_w1: float
     mse_w3: float
     mse_w2: float
     ok: bool
 ```
+
+### 7.1 Derived Rates (per round + aggregate)
+
+The raw timings are only half the picture; to actually compare against a
+hardware spec sheet or `tools/distributed_perf_model.py` we need rates.
+The example computes three:
+
+```python
+# 1. Wire throughput (effective network rate during activation transfer)
+wire_mbps = bytes_recv / (wire_recv_t / 1000) / 1e6
+
+# 2. GPU compute rate (FFN FLOPs / GPU forward time)
+#    SwiGLU per token: w1 matmul = 2*hidden*inter, w3 = 2*hidden*inter,
+#                      silu + mul = ~2*inter (negligible),
+#                      w2 = 2*inter*hidden
+#    Total ≈ 6 * hidden * inter FLOPs per token
+ffn_flops_per_round = 6 * batch * seq * hidden * inter
+gpu_gflops = ffn_flops_per_round / (gpu_forward_t / 1000) / 1e9
+
+# 3. Verify compute rate (SLALOM FLOPs / CPU verify time)
+#    Each SLALOM verify: y@s = (B*S, out)@(out, k) → 2*B*S*out*k FLOPs
+#                       x@s_tilde = (B*S, in)@(in, k) → 2*B*S*in*k FLOPs
+#    For w1, w3: 2*B*S*(inter+hidden)*k each
+#    For w2:     2*B*S*(hidden+inter)*k
+#    Total per round ≈ 6 * B*S * (hidden+inter) * k
+slalom_flops_per_round = 6 * batch * seq * (hidden + inter) * k
+verify_gflops = slalom_flops_per_round / (cpu_verify_t / 1000) / 1e9
+```
+
+Aggregated reporting prints p50 / p95 / mean for each, plus a
+**phase breakdown** (% of end-to-end time spent in each phase):
+
+```
+gpu_pct    = mean(gpu_forward_t) / mean(end_to_end_t)
+wire_pct   = mean(wire_recv_t)   / mean(end_to_end_t)
+verify_pct = mean(cpu_verify_t)  / mean(end_to_end_t)
+sum_pct    = gpu_pct + wire_pct + verify_pct
+             # In this example the worker is intentionally NOT pipelined
+             # (forward fully, sync, then send) and the coordinator does
+             # CPU verify *after* wire-recv completes. So sum_pct should
+             # be ≈ 1.0 — phases are sequential.
+             # Production runtime (verified_core) pipelines D2H with the
+             # next matmul; that would make sum_pct > 1.0 (overlap).
+```
+
+The breakdown's job in this example is to show **which phase to optimize
+first** at a given (network, GPU, CPU) configuration. On a loopback run
+with a fast GPU and slow CPU, `verify_pct` will dominate; on a
+constrained 1 GbE link `wire_pct` will dominate.
 
 `bytes_recv_predicted` (assuming 3D activation tensors, ndim=3):
 ```
@@ -326,7 +381,7 @@ predicted = overhead + y1_bytes + y3_bytes + y2_bytes
 **Summary report** (stdout after N rounds):
 
 ```
-=== Multi-Machine FFN Example: 100 rounds ===
+=== Multi-Machine FFN Example: 200 rounds (warmup=10) ===
 
 Config:
   FFN:      SwiGLU  hidden=4096  inter=11008  dtype=fp16  batch×seq=1×512
@@ -336,13 +391,27 @@ Config:
 
 End-to-end (ms):
   p50   <...>   p95   <...>   mean   <...>
+  Throughput        <...> round/s   ( <...> tokens/s @ B×S = <...> )
+
+Phase timings (ms, mean):
   GPU forward       <...>
-  Wire RTT          <...>     (≈ <X> MB/round → <Y> Gbps effective)
-  CPU SLALOM        <...>     (parallel max(w1,w3) + w2)
+  Wire recv         <...>
+  CPU SLALOM        <...>     (parallel: w1=<...>  w3=<...>  w2=<...>)
+
+Phase breakdown (% of end-to-end, mean):
+  gpu_pct           <...>%
+  wire_pct          <...>%
+  verify_pct        <...>%
+  sum_pct           <...>%    (≈100% expected: example is non-pipelined)
+
+Rate breakdown:
+  Wire throughput   <...> MB/s   ( <...> Gbps effective on TCP )
+  GPU compute       <...> TFLOPS ( <...>% of cuda:0 fp16 peak )
+  CPU SLALOM        <...> GFLOPS ( per-round = <...> MFLOPs / round  )
 
 Wire bytes (per round):
-  Predicted     <X>.X MB
-  Measured      <X>.X MB     (Δ=<...>% framing overhead)
+  Predicted         <X>.X MB
+  Measured          <X>.X MB     (Δ=<...>% framing overhead)
 
 Verification:
   rounds passed     N / N
@@ -351,7 +420,11 @@ Verification:
   mse_w2 p95        <...>
 ```
 
-`--verbose` prints one line per round.
+CLI flags relevant to perf reporting:
+- `--rounds N`           total rounds (default 100; perf runs use 200+)
+- `--warmup N`           skip first N rounds from aggregation (default 10)
+- `--json-report path`   also dump full per-round metrics + summary as JSON
+- `--verbose`            one line per round to stdout
 
 ---
 
@@ -385,6 +458,8 @@ Verification:
 --worker-host    HOST                                coordinator only
 --worker-port    INT                                 default: 9100
 --rounds         INT                                 default: 100
+--warmup         INT                                 default: 10  (skipped from aggregation)
+--json-report    PATH                                 dump per-round metrics + summary as JSON
 --hidden         INT                                 default: 4096
 --inter          INT                                 default: 11008
 --batch          INT                                 default: 1
@@ -432,9 +507,13 @@ allocated port to the worker subprocess. Avoids hardcoding 9100 in CI.
 
 ## 11. Testing
 
-`tests/test_multi_machine_ffn_example.py`. Each test starts a worker
-subprocess on a random port and runs a coordinator in-process (so we
-can assert on metrics directly).
+Tests split into two files. Functional tests run fast and live in
+default CI; perf tests are gated and read thresholds from env vars.
+
+### 11.1 `tests/test_multi_machine_ffn_example.py` — functional
+
+Each test starts a worker subprocess on a random port and runs a
+coordinator in-process so we can assert on metrics directly.
 
 | Test | What it checks |
 |---|---|
@@ -445,21 +524,61 @@ can assert on metrics directly).
 | `test_wire_bytes_predicted_matches` | `abs(measured - predicted) / predicted < 0.01` |
 | `test_close_message_shuts_worker` | After CLOSE, worker exits 0 within 2 s |
 | `test_wire_dtype_fp32_also_works` | `--wire-dtype fp32` passes clean |
+| `test_json_report_schema` | `--json-report` writes parseable JSON containing all RoundMetrics fields + summary |
 
 Each test ≤ 2 seconds wall-clock. Total suite < 15 s.
+
+### 11.2 `tests/test_multi_machine_ffn_perf.py` — performance breakdown
+
+Gated by `pytest -m perf` (mark applied at module level) so it doesn't
+run on every CI; run explicitly when comparing two changes or two
+machines. Each test does: warmup 10 rounds, measure 200 rounds, assert
+on aggregated rates. Thresholds are conservative defaults overridable
+by env vars (`FFN_PERF_MIN_ROUND_PER_S`, `FFN_PERF_MAX_P95_MS`,
+`FFN_PERF_MIN_WIRE_MBPS`).
+
+| Test | What it checks | Default threshold |
+|---|---|---|
+| `test_steady_state_throughput` | round/s above floor on loopback `cuda:0` | ≥ 20 round/s @ 4096/11008/fp16/1×512 |
+| `test_p95_latency_bounded` | p95 end-to-end ≤ ceiling | ≤ 100 ms (same shape) |
+| `test_breakdown_sums_to_one` | `0.9 ≤ sum_pct ≤ 1.1` (sanity: phases don't overlap → sequential model holds) | — |
+| `test_wire_throughput_close_to_link` | Loopback `wire_mbps` ≥ 1 GB/s (loopback should easily hit this) | ≥ 1000 MB/s |
+| `test_gpu_utilization_nonzero` | `gpu_gflops > 0` and `< theoretical_peak`; sanity that FLOPs computation is correct | — |
+| `test_verify_rate_nonzero` | `verify_gflops > 0` and roughly matches numpy single-thread (≥ 5 GFLOPS) | ≥ 5 GFLOPS |
+| `test_warmup_excluded_from_aggregation` | First 10 rounds NOT in summary stats; assert by injecting a known slow first round and seeing it ignored | — |
+| `test_breakdown_dominant_phase_on_slow_cpu` | `--device cpu` makes `verify_pct < gpu_pct` (CPU slow, but GPU=CPU also slow → check verify still computes); shape-dependent skip on no-CUDA | — |
+
+A perf test does NOT skip silently on missing CUDA — it `pytest.skip()`
+with a clear reason. CI without GPU will see "8 skipped" instead of
+silent passes.
+
+Each perf test ≤ 30 s. Total perf suite < 4 min on a single 4090.
+
+### 11.3 Standalone perf invocation
+
+Outside pytest, the canonical perf run is:
+
+```bash
+python examples/multi_machine_ffn.py --rounds 500 --warmup 50 \
+    --json-report /tmp/ffn_perf.json --verbose | tee /tmp/ffn_perf.log
+```
+
+The JSON has the same schema as `RoundMetrics` arrayed + a summary
+block. This is what gets attached to perf-related PRs.
 
 ---
 
 ## 12. File Manifest
 
 ```
-examples/multi_machine_ffn.py            ~450 lines  new
-tests/test_multi_machine_ffn_example.py  ~180 lines  new
+examples/multi_machine_ffn.py            ~500 lines  new
+tests/test_multi_machine_ffn_example.py  ~200 lines  new
+tests/test_multi_machine_ffn_perf.py     ~180 lines  new (pytest -m perf)
 ```
 
 No edits to existing files. Dependencies: `torch`, `numpy`, Python
 stdlib (`socket`, `struct`, `subprocess`, `argparse`,
-`concurrent.futures`, `dataclasses`, `time`).
+`concurrent.futures`, `dataclasses`, `json`, `time`).
 
 ---
 
