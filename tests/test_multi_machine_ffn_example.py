@@ -707,3 +707,45 @@ def test_inject_drop_silu_caught_via_chain():
         assert all(r.mse_w2 > threshold for r in results)
         assert all(r.mse_w1 < threshold and r.mse_w3 < threshold
                    for r in results)
+
+
+def test_pipeline_mode_verifies_and_overlaps(tmp_path):
+    """--pipeline keeps verification correct AND overlaps verify with recv,
+    so the per-round sum (gpu + wire + verify) exceeds end-to-end time —
+    i.e. mean_sum_pct > 1.0. The non-pipelined run is ~1.0."""
+    json_path = tmp_path / "pipe.json"
+    cmd = [_sys.executable, str(EXAMPLE_PATH),
+           "--role", "loopback", "--pipeline",
+           "--rounds", "12", "--warmup", "2",
+           "--hidden", "256", "--inter", "704",
+           "--batch", "1", "--seq", "32",
+           "--wire-dtype", "fp16", "--device", "cpu",
+           "--json-report", str(json_path)]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, f"stderr={res.stderr}\nstdout={res.stdout}"
+    assert "Pipeline: on" in res.stdout
+    import json as _json
+    data = _json.loads(json_path.read_text())
+    assert data["summary"]["rounds_passed"] == 10  # 12 - 2 warmup
+    # Overlap signature: the three phases together exceed wall-clock e2e.
+    assert data["summary"]["mean_sum_pct"] > 1.0, data["summary"]
+
+
+def test_non_pipeline_mode_phases_are_sequential(tmp_path):
+    """Without --pipeline, mean_sum_pct ≈ 1.0 (phases run back-to-back)."""
+    json_path = tmp_path / "seq.json"
+    cmd = [_sys.executable, str(EXAMPLE_PATH),
+           "--role", "loopback",
+           "--rounds", "12", "--warmup", "2",
+           "--hidden", "256", "--inter", "704",
+           "--batch", "1", "--seq", "32",
+           "--wire-dtype", "fp16", "--device", "cpu",
+           "--json-report", str(json_path)]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, f"stderr={res.stderr}\nstdout={res.stdout}"
+    assert "Pipeline: off" in res.stdout
+    import json as _json
+    data = _json.loads(json_path.read_text())
+    assert data["summary"]["rounds_passed"] == 10
+    # Sequential: allow generous tolerance for timing jitter.
+    assert 0.85 <= data["summary"]["mean_sum_pct"] <= 1.15, data["summary"]

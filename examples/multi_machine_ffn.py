@@ -16,10 +16,12 @@ from __future__ import annotations
 # ── Imports ─────────────────────────────────────────────────────────
 import argparse
 import json
+import queue
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -233,11 +235,12 @@ class Worker:
     """Untrusted GPU host. Serves one coordinator at a time."""
 
     def __init__(self, bind_host: str, bind_port: int, device: str,
-                 inject_fault: str = "none"):
+                 inject_fault: str = "none", pipeline: bool = False):
         self.bind_host = bind_host
         self.bind_port = bind_port
         self.device = torch.device(device)
         self.inject_fault = inject_fault
+        self.pipeline = pipeline
         self.w1: Optional[nn.Linear] = None
         self.w2: Optional[nn.Linear] = None
         self.w3: Optional[nn.Linear] = None
@@ -323,14 +326,49 @@ class Worker:
 
         y1, y3, y2 = self._apply_fault(y1, y3, y2, gated)
 
-        send_msg(sock, MSG_ACTIVATION,
-                 pack_activation(request_id, OP_W1, y1, self.wire_dtype_id))
-        send_msg(sock, MSG_ACTIVATION,
-                 pack_activation(request_id, OP_W3, y3, self.wire_dtype_id))
-        send_msg(sock, MSG_ACTIVATION,
-                 pack_activation(request_id, OP_W2, y2, self.wire_dtype_id))
-        send_msg(sock, MSG_FORWARD_DONE,
-                 pack_forward_done(request_id, gpu_t_ms))
+        if self.pipeline:
+            self._send_pipelined(sock, request_id, y1, y3, y2, gpu_t_ms)
+        else:
+            send_msg(sock, MSG_ACTIVATION,
+                     pack_activation(request_id, OP_W1, y1, self.wire_dtype_id))
+            send_msg(sock, MSG_ACTIVATION,
+                     pack_activation(request_id, OP_W3, y3, self.wire_dtype_id))
+            send_msg(sock, MSG_ACTIVATION,
+                     pack_activation(request_id, OP_W2, y2, self.wire_dtype_id))
+            send_msg(sock, MSG_FORWARD_DONE,
+                     pack_forward_done(request_id, gpu_t_ms))
+
+    def _send_pipelined(self, sock, request_id, y1, y3, y2, gpu_t_ms) -> None:
+        """Pipelined send: a background thread pushes each activation over TCP
+        while this thread continues D2H + packs the next one. The transmission
+        of y1 overlaps with the D2H/packing of y3, y2 — a real win on slow
+        links (negligible on loopback, but it demonstrates the mechanism)."""
+        send_q: "queue.Queue" = queue.Queue()
+        sender_exc: list = []
+
+        def _sender():
+            try:
+                while True:
+                    item = send_q.get()
+                    if item is None:
+                        return
+                    mtype, body = item
+                    send_msg(sock, mtype, body)
+            except Exception as e:  # propagate to main thread
+                sender_exc.append(e)
+
+        sender = threading.Thread(target=_sender, daemon=True)
+        sender.start()
+        # pack_activation does the D2H synchronously; queueing hands the bytes
+        # to the sender thread, freeing this thread to pack the next one.
+        send_q.put((MSG_ACTIVATION, pack_activation(request_id, OP_W1, y1, self.wire_dtype_id)))
+        send_q.put((MSG_ACTIVATION, pack_activation(request_id, OP_W3, y3, self.wire_dtype_id)))
+        send_q.put((MSG_ACTIVATION, pack_activation(request_id, OP_W2, y2, self.wire_dtype_id)))
+        send_q.put((MSG_FORWARD_DONE, pack_forward_done(request_id, gpu_t_ms)))
+        send_q.put(None)
+        sender.join()
+        if sender_exc:
+            raise sender_exc[0]
 
     def _apply_fault(self, y1, y3, y2, gated):
         if self.inject_fault == "none":
@@ -409,7 +447,7 @@ def _percentile(xs: list[float], q: float) -> float:
 
 
 def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
-                    warmup: int, k: int = SLALOM_K) -> str:
+                    warmup: int, k: int = SLALOM_K, pipelined: bool = False) -> str:
     measured = rounds[warmup:] if warmup > 0 else rounds
     if not measured:
         return "(no rounds measured after warmup)"
@@ -434,7 +472,8 @@ def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
         "Config:\n"
         f"  FFN:      SwiGLU  hidden={cfg.hidden}  inter={cfg.inter}  "
         f"dtype={_DTYPE_NAME[cfg.wire_dtype]}  batch×seq={cfg.batch}×{cfg.seq}\n"
-        f"  Verify:   SLALOM  k={k}\n\n"
+        f"  Verify:   SLALOM  k={k}\n"
+        f"  Pipeline: {'on (send/verify overlap compute/recv)' if pipelined else 'off (phases sequential)'}\n\n"
         "End-to-end (ms):\n"
         f"  p50   {_percentile(e2e, 50):.2f}   "
         f"p95   {_percentile(e2e, 95):.2f}   "
@@ -452,7 +491,8 @@ def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
         f"  gpu_pct           {_mean([r['gpu_pct'] for r in rates])*100:.1f}%\n"
         f"  wire_pct          {_mean([r['wire_pct'] for r in rates])*100:.1f}%\n"
         f"  verify_pct        {_mean([r['verify_pct'] for r in rates])*100:.1f}%\n"
-        f"  sum_pct           {_mean([r['sum_pct'] for r in rates])*100:.1f}%\n\n"
+        f"  sum_pct           {_mean([r['sum_pct'] for r in rates])*100:.1f}%"
+        f"{'  (>100% = phases overlap, pipeline working)' if pipelined else '  (≈100% expected, sequential)'}\n\n"
         "Rate breakdown:\n"
         f"  Wire throughput   {_mean([r['wire_mbps'] for r in rates]):.1f} MB/s\n"
         f"  GPU compute       {_mean([r['gpu_gflops'] for r in rates])/1000.0:.2f} TFLOPS\n"
@@ -520,12 +560,14 @@ class Coordinator:
     """Trusted host. Owns SLALOM state and verifies every linear output."""
 
     def __init__(self, host: str, port: int, config: FFNConfig,
-                 threshold: float = 1e-3, k: int = SLALOM_K):
+                 threshold: float = 1e-3, k: int = SLALOM_K,
+                 pipeline: bool = False):
         self.host = host
         self.port = port
         self.config = config
         self.threshold = threshold
         self.k = k
+        self.pipeline = pipeline
         # CPU-side fp32 copy of weights (used for s_tilde precompute)
         self.w1, self.w2, self.w3 = make_weights(
             config.hidden, config.inter, config.weight_seed,
@@ -583,6 +625,16 @@ class Coordinator:
         return 3 * (frame_hdr + activation_body_hdr) + (frame_hdr + done_body) \
                + y1_bytes + y3_bytes + y2_bytes
 
+    @staticmethod
+    def _timed(fn, *args):
+        t0 = time.perf_counter()
+        mse = fn(*args)
+        return mse, (time.perf_counter() - t0) * 1000.0
+
+    def _expected_shape(self, op_tag: int) -> tuple:
+        out = self.config.inter if op_tag in (OP_W1, OP_W3) else self.config.hidden
+        return (self.config.batch, self.config.seq, out)
+
     def run_round(self, request_id: int, input_seed: int) -> RoundMetrics:
         assert self.sock is not None, "call connect_and_load() first"
         rm = RoundMetrics(request_id=request_id)
@@ -590,17 +642,21 @@ class Coordinator:
 
         x_cpu = self.reproduce_input_cpu(input_seed)
 
-        # Send FORWARD_REQ
         t_start = time.perf_counter()
         req_body = pack_forward_req(request_id, input_seed,
                                      self.config.batch, self.config.seq)
         rm.bytes_sent = send_msg(self.sock, MSG_FORWARD_REQ, req_body)
 
-        # Receive 3 ACTIVATION + 1 FORWARD_DONE
+        # Receive 3 ACTIVATION + 1 FORWARD_DONE. In pipeline mode, each
+        # SLALOM check is submitted to the pool the moment its activation
+        # arrives — so verification of y1 overlaps with the receive of y3,
+        # and verification of y3 overlaps with the receive of y2.
         t_wire_start = time.perf_counter()
         bytes_recv = 0
         first_act_t: Optional[float] = None
+        first_submit_t: Optional[float] = None
         acts: dict[int, torch.Tensor] = {}
+        futures: dict[int, object] = {}
         gpu_forward_t_ms = 0.0
         done = False
         while not done or len(acts) < 3:
@@ -612,18 +668,30 @@ class Coordinator:
                 d = unpack_activation(body)
                 op_tag = d["op_tag"]
                 tensor = d["tensor"]
-                # Validate against expected per-layer shape.
-                expected_out = (self.config.inter
-                                if op_tag in (OP_W1, OP_W3)
-                                else self.config.hidden)
-                expected_shape = (self.config.batch, self.config.seq,
-                                   expected_out)
-                if tuple(tensor.shape) != expected_shape:
+                if tuple(tensor.shape) != self._expected_shape(op_tag):
                     raise WireProtocolError(
-                        f"op_tag={op_tag}: expected shape {expected_shape}, "
-                        f"got {tuple(tensor.shape)}"
+                        f"op_tag={op_tag}: expected shape "
+                        f"{self._expected_shape(op_tag)}, got {tuple(tensor.shape)}"
                     )
-                acts[op_tag] = tensor
+                t32 = tensor.to(torch.float32)
+                acts[op_tag] = t32
+                if self.pipeline:
+                    if first_submit_t is None:
+                        first_submit_t = time.perf_counter()
+                    if op_tag == OP_W1:
+                        futures[OP_W1] = self.pool.submit(
+                            self._timed, slalom_verify_safe,
+                            x_cpu, t32, self.s_w1, self.s_tilde_w1)
+                    elif op_tag == OP_W3:
+                        futures[OP_W3] = self.pool.submit(
+                            self._timed, slalom_verify_safe,
+                            x_cpu, t32, self.s_w3, self.s_tilde_w3)
+                    elif op_tag == OP_W2:
+                        # y1 and y3 already arrived (wire order is W1, W3, W2).
+                        gated_cpu = F.silu(acts[OP_W1]) * acts[OP_W3]
+                        futures[OP_W2] = self.pool.submit(
+                            self._timed, slalom_verify_safe,
+                            gated_cpu, t32, self.s_w2, self.s_tilde_w2)
             elif mt == MSG_FORWARD_DONE:
                 d = unpack_forward_done(body)
                 gpu_forward_t_ms = d["gpu_forward_t_ms"]
@@ -636,30 +704,33 @@ class Coordinator:
         rm.coord_send_t = ((first_act_t or t_wire_end) - t_start) * 1000.0
         rm.wire_recv_t = (t_wire_end - t_wire_start) * 1000.0
 
-        # Verify (w1 and w3 in parallel; w2 after gated_cpu is built)
-        t_verify_start = time.perf_counter()
-        y1 = acts[OP_W1].to(torch.float32)
-        y3 = acts[OP_W3].to(torch.float32)
-        y2 = acts[OP_W2].to(torch.float32)
+        if self.pipeline:
+            # Verifications were kicked off during the receive loop. Collect
+            # the (still-running or finished) futures. cpu_verify_t spans from
+            # the first submit to the last result — it overlaps wire_recv_t,
+            # which is why sum_pct comes out > 100% in this mode.
+            rm.mse_w1, rm.cpu_verify_w1_t = futures[OP_W1].result()
+            rm.mse_w3, rm.cpu_verify_w3_t = futures[OP_W3].result()
+            rm.mse_w2, rm.cpu_verify_w2_t = futures[OP_W2].result()
+            t_verify_end = time.perf_counter()
+            rm.cpu_verify_t = (t_verify_end - (first_submit_t or t_wire_end)) * 1000.0
+        else:
+            # Sequential: verify only after the full receive completes.
+            t_verify_start = time.perf_counter()
+            y1, y3, y2 = acts[OP_W1], acts[OP_W3], acts[OP_W2]
+            f_w1 = self.pool.submit(self._timed, slalom_verify_safe,
+                                    x_cpu, y1, self.s_w1, self.s_tilde_w1)
+            f_w3 = self.pool.submit(self._timed, slalom_verify_safe,
+                                    x_cpu, y3, self.s_w3, self.s_tilde_w3)
+            rm.mse_w1, rm.cpu_verify_w1_t = f_w1.result()
+            rm.mse_w3, rm.cpu_verify_w3_t = f_w3.result()
+            gated_cpu = F.silu(y1) * y3
+            f_w2 = self.pool.submit(self._timed, slalom_verify_safe,
+                                    gated_cpu, y2, self.s_w2, self.s_tilde_w2)
+            rm.mse_w2, rm.cpu_verify_w2_t = f_w2.result()
+            rm.cpu_verify_t = (time.perf_counter() - t_verify_start) * 1000.0
 
-        def _timed(fn, *args):
-            t0 = time.perf_counter()
-            mse = fn(*args)
-            return mse, (time.perf_counter() - t0) * 1000.0
-
-        f_w1 = self.pool.submit(_timed, slalom_verify_safe,
-                                x_cpu, y1, self.s_w1, self.s_tilde_w1)
-        f_w3 = self.pool.submit(_timed, slalom_verify_safe,
-                                x_cpu, y3, self.s_w3, self.s_tilde_w3)
-        rm.mse_w1, rm.cpu_verify_w1_t = f_w1.result()
-        rm.mse_w3, rm.cpu_verify_w3_t = f_w3.result()
-        gated_cpu = F.silu(y1) * y3
-        f_w2 = self.pool.submit(_timed, slalom_verify_safe,
-                                gated_cpu, y2, self.s_w2, self.s_tilde_w2)
-        rm.mse_w2, rm.cpu_verify_w2_t = f_w2.result()
-        rm.cpu_verify_t = (time.perf_counter() - t_verify_start) * 1000.0
         rm.end_to_end_t = (time.perf_counter() - t_start) * 1000.0
-
         rm.ok = (rm.mse_w1 <= self.threshold
                  and rm.mse_w3 <= self.threshold
                  and rm.mse_w2 <= self.threshold)
@@ -715,13 +786,15 @@ def run_coordinator(host: str, port: int, args) -> int:
     if threshold is None:
         threshold = default_threshold(cfg.wire_dtype, cfg.inter)
     coord = Coordinator(host=host, port=port, config=cfg,
-                         threshold=threshold, k=SLALOM_K)
+                         threshold=threshold, k=SLALOM_K,
+                         pipeline=args.pipeline)
     try:
         coord.connect_and_load()
         rounds = coord.run_many(rounds=args.rounds)
     finally:
         coord.close()
-    print(format_summary(rounds, cfg, warmup=args.warmup, k=SLALOM_K))
+    print(format_summary(rounds, cfg, warmup=args.warmup, k=SLALOM_K,
+                         pipelined=args.pipeline))
     if args.json_report:
         write_json_report(args.json_report, rounds, cfg,
                           warmup=args.warmup, k=SLALOM_K)
@@ -744,6 +817,8 @@ def launch_loopback(args) -> int:
         "--device", args.device,
         "--inject-fault", args.inject_fault,
     ]
+    if args.pipeline:
+        worker_cmd.append("--pipeline")
     proc = subprocess.Popen(worker_cmd, stderr=subprocess.PIPE)
     try:
         _wait_port(port)
@@ -792,12 +867,16 @@ def main() -> int:
     p.add_argument("--inject-fault", default="none",
                    choices=["none", "flip_y1", "scale_y2", "drop_silu"])
     p.add_argument("--json-report", default=None)
+    p.add_argument("--pipeline", action="store_true",
+                   help="overlap worker send with compute and coordinator "
+                        "verify with receive (sum_pct then exceeds 100%%)")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
     if args.role == "worker":
         host, port_s = args.bind.split(":")
-        Worker(host, int(port_s), args.device, args.inject_fault).serve_once()
+        Worker(host, int(port_s), args.device, args.inject_fault,
+               pipeline=args.pipeline).serve_once()
         return 0
     if args.role == "coordinator":
         return run_coordinator(args.worker_host, args.worker_port, args)
