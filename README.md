@@ -77,6 +77,54 @@ print(tokenizer.decode(output[0], skip_special_tokens=True))
 
 ---
 
+## Running on Two Machines
+
+The full LLM / diffusion stack runs in a single process. Cross-machine
+deployment (1 trusted CPU coordinator + N untrusted GPU workers) is
+described in [`docs/MULTI_MACHINE.md`](docs/MULTI_MACHINE.md); the
+runnable slice today is [`examples/multi_machine_ffn.py`](examples/multi_machine_ffn.py)
+— a coordinator + worker over TCP, outputs-only wire, real SLALOM
+verification of a SwiGLU MLP.
+
+The two roles have **different dependencies** — the GPU worker needs a
+CUDA PyTorch build and the model libraries; the CPU coordinator needs
+only a CPU-only PyTorch build plus the profiler/wire deps:
+
+| | GPU worker (untrusted) | CPU coordinator / TEE (trusted) |
+|---|---|---|
+| PyTorch | CUDA build (`--index-url .../cu128`) | CPU-only build (`--index-url .../cpu`) |
+| Requirements file | `requirements-gpu.txt` | `requirements-cpu.txt` |
+| Extra libs | transformers, diffusers, safetensors, accelerate | pandas, matplotlib (transformers/safetensors only if it re-derives SLALOM `s_tilde` from local weights) |
+
+**Machine A — GPU worker:**
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements-gpu.txt
+
+python examples/multi_machine_ffn.py --role worker --bind 0.0.0.0:9100
+```
+
+**Machine B — CPU coordinator / TEE host:**
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements-cpu.txt
+
+python examples/multi_machine_ffn.py --role coordinator \
+    --worker-host <machine-A-ip> --worker-port 9100 \
+    --rounds 100 --hidden 4096 --inter 11008 --wire-dtype fp16
+```
+
+For a single-machine smoke test, run `python examples/multi_machine_ffn.py`
+(default `--role loopback` — it forks its own worker). Useful flags:
+`--inject-fault ...` (verify the coordinator catches a corrupted matmul),
+`--pipeline` (overlap send/recv with compute), `--json-report out.json`.
+
+(`requirements.txt` remains the single-machine, full-stack install.)
+
+---
+
 ## How It Works
 
 ### Architecture
