@@ -1,0 +1,19 @@
+# CPU coordinator / TEE host (trusted) — async SLALOM + Freivalds
+# verification only. No CUDA, no model forward pass.
+#
+# Install the CPU-only PyTorch build first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# then:
+#   pip install -r requirements-cpu.txt
+
+torch                # CPU-only build (see note above)
+numpy                # wire (de)serialization + Freivalds vectors
+pandas               # profiler CSV/JSON export
+matplotlib           # profiler timeline plots
+
+# Only needed if the coordinator re-derives the SLALOM s_tilde and runs
+# the embedding / patchifier bootstrap from a local copy of the weights
+# (see docs/MULTI_MACHINE.md §5.3, §8). Omit for the FFN example, which
+# generates its own weights.
+transformers
+safetensors

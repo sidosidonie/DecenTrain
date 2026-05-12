@@ -1,0 +1,13 @@
+# GPU worker (untrusted) — runs the model forward pass on CUDA.
+#
+# Install a CUDA build of PyTorch first, matching your driver, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# then:
+#   pip install -r requirements-gpu.txt
+
+torch                # CUDA build (see note above)
+transformers         # Llama / Qwen / Mistral model loading
+diffusers            # Z-Image diffusion transformer
+safetensors          # weight loading
+accelerate           # device placement / dtype handling
+numpy                # wire (de)serialization of activation tensors
