@@ -236,12 +236,14 @@ class Worker:
     """Untrusted GPU host. Serves one coordinator at a time."""
 
     def __init__(self, bind_host: str, bind_port: int, device: str,
-                 inject_fault: str = "none", pipeline: bool = False):
+                 inject_fault: str = "none", pipeline: bool = False,
+                 quiet: bool = False):
         self.bind_host = bind_host
         self.bind_port = bind_port
         self.device = torch.device(device)
         self.inject_fault = inject_fault
         self.pipeline = pipeline
+        self.quiet = quiet
         self.w1: Optional[nn.Linear] = None
         self.w2: Optional[nn.Linear] = None
         self.w3: Optional[nn.Linear] = None
@@ -249,6 +251,21 @@ class Worker:
         self.inter = 0
         self.wire_dtype_id = DTYPE_FP16
         self.compute_dtype: torch.dtype = torch.float16
+        self._round_count = 0
+
+    def _log(self, msg: str) -> None:
+        """Progress line on stdout so it's visible whether the worker was
+        launched directly (run_gpu_worker.sh) or as a loopback subprocess
+        (whose stdout is inherited; only its stderr gets captured)."""
+        if self.quiet:
+            return
+        print(f"[worker {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    def _gpu_mem_str(self) -> str:
+        if self.device.type != "cuda":
+            return ""
+        alloc = torch.cuda.memory_allocated(self.device) / 1e6
+        return f", GPU mem {alloc:.0f} MB"
 
     def serve_once(self) -> None:
         """Accept one real coordinator, serve until CLOSE or disconnect.
@@ -261,15 +278,24 @@ class Worker:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.bind_host, self.bind_port))
         srv.listen(8)
+        dev_extra = (f" ({torch.cuda.get_device_name(self.device)})"
+                     if self.device.type == "cuda" else "")
+        self._log(f"listening on {self.bind_host}:{self.bind_port}  "
+                  f"device={self.device}{dev_extra}  fault={self.inject_fault}  "
+                  f"pipeline={self.pipeline}")
+        self._log("waiting for a coordinator to connect…")
         try:
             while True:
                 sock, _addr = srv.accept()
+                self._log(f"connection from {_addr[0]}:{_addr[1]}")
                 try:
                     handled = self._serve_session(sock)
                 finally:
                     sock.close()
                 if handled:
+                    self._log(f"session ended (served {self._round_count} round(s)); exiting")
                     return
+                self._log("(empty probe connection — still waiting for a coordinator…)")
         finally:
             srv.close()
 
@@ -286,6 +312,7 @@ class Worker:
                 fields = unpack_load_req(body)
                 self._handle_load(sock, fields)
             elif msg_type == MSG_CLOSE:
+                self._log("coordinator sent CLOSE")
                 return handled
             elif msg_type == MSG_FORWARD_REQ:
                 fields = unpack_forward_req(body)
@@ -302,7 +329,12 @@ class Worker:
             self.hidden, self.inter, fields["weight_seed"],
             dtype=self.compute_dtype, device=self.device,
         )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         send_msg(sock, MSG_LOAD_ACK, pack_load_ack(0))
+        self._log(f"LOAD: SwiGLU hidden={self.hidden} inter={self.inter} "
+                  f"wire={_DTYPE_NAME[self.wire_dtype_id]} → weights on "
+                  f"{self.device}{self._gpu_mem_str()}; ready for FORWARD requests")
 
     def _handle_forward(self, sock: socket.socket, fields: dict) -> None:
         request_id = fields["request_id"]
@@ -338,6 +370,16 @@ class Worker:
                      pack_activation(request_id, OP_W2, y2, self.wire_dtype_id))
             send_msg(sock, MSG_FORWARD_DONE,
                      pack_forward_done(request_id, gpu_t_ms))
+
+        self._round_count += 1
+        sent_mb = ((y1.numel() + y3.numel() + y2.numel())
+                   * _DTYPE_SIZE[self.wire_dtype_id]) / 1e6
+        fault_note = f"  [INJECTED FAULT: {self.inject_fault}]" if self.inject_fault != "none" else ""
+        send_mode = "pipelined" if self.pipeline else "sequential"
+        self._log(f"round #{self._round_count} (req {request_id}): "
+                  f"x[{batch},{seq},{self.hidden}] → forward {gpu_t_ms:.2f} ms on "
+                  f"{self.device.type}, sent y1/y3{tuple(y1.shape)} y2{tuple(y2.shape)} "
+                  f"= {sent_mb:.2f} MB ({send_mode}){fault_note}")
 
     def _send_pipelined(self, sock, request_id, y1, y3, y2, gpu_t_ms) -> None:
         """Pipelined send: a background thread pushes each activation over TCP
@@ -943,12 +985,14 @@ def main() -> int:
                    help="overlap worker send with compute and coordinator "
                         "verify with receive (sum_pct then exceeds 100%%)")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--quiet", action="store_true",
+                   help="suppress the worker's per-round progress log")
     args = p.parse_args()
 
     if args.role == "worker":
         host, port_s = args.bind.split(":")
         Worker(host, int(port_s), args.device, args.inject_fault,
-               pipeline=args.pipeline).serve_once()
+               pipeline=args.pipeline, quiet=args.quiet).serve_once()
         return 0
     if args.role == "coordinator":
         return run_coordinator(args.worker_host, args.worker_port, args)
