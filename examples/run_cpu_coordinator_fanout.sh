@@ -31,6 +31,7 @@
 #   SEQ          sequence length                        (default: 512)
 #   WIRE_DTYPE   fp16|fp32 on-wire activation dtype     (default: fp16)
 #   LINK_GBPS    nominal link bandwidth (Gbit/s)        (default: unset)
+#   PIPELINE     1 to enable --pipeline on every coord  (default: 0)  -- must match the workers
 #   THREADS      OMP/torch threads per coordinator      (default: 8)
 #   OUTDIR       dir for per-stream logs + JSON reports (default: fanout_<ts>)
 #   PYTHON       python interpreter                     (default: python)
@@ -54,6 +55,7 @@ INTER="${INTER:-11008}"
 BATCH="${BATCH:-1}"
 SEQ="${SEQ:-512}"
 WIRE_DTYPE="${WIRE_DTYPE:-fp16}"
+PIPELINE="${PIPELINE:-0}"
 THREADS="${THREADS:-8}"
 PYTHON="${PYTHON:-python}"
 OUTDIR="${OUTDIR:-fanout_$(date +%Y%m%d_%H%M%S)}"
@@ -76,6 +78,7 @@ for i in $(seq 0 $((N-1))); do
         --json-report "${OUTDIR}/coord_${i}.json")
   [ -n "${THRESHOLD:-}" ] && ARGS+=(--threshold "${THRESHOLD}")
   [ -n "${LINK_GBPS:-}" ] && ARGS+=(--link-gbps "${LINK_GBPS}")
+  [ "${PIPELINE}" = "1" ] && ARGS+=(--pipeline)
   OMP_NUM_THREADS="${THREADS}" MKL_NUM_THREADS="${THREADS}" \
     "${PYTHON}" "${ARGS[@]}" > "${OUTDIR}/coord_${i}.log" 2>&1 &
   pids+=($!)
