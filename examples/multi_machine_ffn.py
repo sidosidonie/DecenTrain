@@ -46,6 +46,7 @@ MSG_CLOSE = 6
 OP_W1 = 1
 OP_W3 = 2
 OP_W2 = 3
+_OP_NAME = {OP_W1: "y1 (w1)", OP_W3: "y3 (w3)", OP_W2: "y2 (w2)"}
 
 # Wire dtypes
 DTYPE_FP32 = 1
@@ -402,6 +403,9 @@ class RoundMetrics:
     bytes_sent: int = 0
     bytes_recv: int = 0
     bytes_recv_predicted: int = 0
+    # Per-tensor wire record for the activations the worker sent back:
+    #   op_tag -> {"shape": [...], "dtype": "fp16", "bytes": <incl. msg header>}
+    recv_tensors: dict = field(default_factory=dict)
     # Verification
     mse_w1: float = 0.0
     mse_w3: float = 0.0
@@ -447,7 +451,8 @@ def _percentile(xs: list[float], q: float) -> float:
 
 
 def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
-                    warmup: int, k: int = SLALOM_K, pipelined: bool = False) -> str:
+                    warmup: int, k: int = SLALOM_K, pipelined: bool = False,
+                    link_gbps: Optional[float] = None) -> str:
     measured = rounds[warmup:] if warmup > 0 else rounds
     if not measured:
         return "(no rounds measured after warmup)"
@@ -465,6 +470,44 @@ def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
 
     bytes_recv_mb = _mean([r.bytes_recv for r in measured]) / 1e6
     bytes_pred_mb = _mean([r.bytes_recv_predicted for r in measured]) / 1e6
+
+    # Per-tensor wire record. Shapes/dtypes are constant across rounds, so take
+    # them from the first measured round that captured them.
+    wire_tensors = next((r.recv_tensors for r in measured if r.recv_tensors), {})
+    wire_tensor_lines = "".join(
+        f"  {_OP_NAME.get(op, f'op{op}'):<10} "
+        f"shape={str(tuple(info['shape'])):<18} "
+        f"dtype={info['dtype']:<5} {info['bytes']/1e6:6.2f} MB\n"
+        for op, info in sorted(wire_tensors.items())
+    ) or "  (none captured)\n"
+
+    # ── Wire estimate: ideal-vs-measured transfer for this payload size ──
+    # "On-wire" time = the recv window minus the worker's forward (which runs
+    # inside it), i.e. the time actually spent moving bytes back.
+    payload_bytes = _mean([r.bytes_recv for r in measured])
+    payload_bits = payload_bytes * 8.0
+    wire_only_ms = _mean(
+        [max(0.0, r.wire_recv_t - r.gpu_forward_t) for r in measured])
+    eff_gbps = (payload_bits / (wire_only_ms / 1000.0) / 1e9) if wire_only_ms > 0 else 0.0
+    ref_gbps = [1.0, 10.0, 25.0]
+    if link_gbps and not any(abs(g - link_gbps) < 1e-9 for g in ref_gbps):
+        ref_gbps = sorted(ref_gbps + [link_gbps])
+
+    def _ideal_ms(gbps: float) -> float:
+        return payload_bits / (gbps * 1e9) * 1000.0 if gbps > 0 else 0.0
+
+    wire_est_lines = (
+        f"  measured            {wire_only_ms:8.2f} ms  →  {eff_gbps:6.2f} "
+        "Gbit/s effective  (recv window minus GPU forward)\n"
+    )
+    for g in ref_gbps:
+        tag = "   ← --link-gbps" if link_gbps and abs(g - link_gbps) < 1e-9 else ""
+        wire_est_lines += f"  @ {g:g} Gbit/s ideal  {_ideal_ms(g):8.2f} ms{tag}\n"
+    if link_gbps:
+        wire_est_lines += (
+            f"  link efficiency     {eff_gbps / link_gbps * 100:8.1f} %   "
+            f"of nominal {link_gbps:g} Gbit/s\n"
+        )
 
     return (
         "=== Multi-Machine FFN Example: "
@@ -500,6 +543,10 @@ def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
         "Wire bytes (per round):\n"
         f"  Predicted         {bytes_pred_mb:.2f} MB\n"
         f"  Measured          {bytes_recv_mb:.2f} MB\n\n"
+        "Wire tensors (per round, worker→coordinator):\n"
+        f"{wire_tensor_lines}\n"
+        f"Wire estimate (per round, {payload_bytes/1e6:.2f} MB payload):\n"
+        f"{wire_est_lines}\n"
         "Verification:\n"
         f"  rounds passed     {passed} / {len(measured)}\n"
         f"  mse_w1 p95        {_percentile([r.mse_w1 for r in measured], 95):.2e}\n"
@@ -509,7 +556,8 @@ def format_summary(rounds: list[RoundMetrics], cfg: FFNConfig, *,
 
 
 def write_json_report(path, rounds: list[RoundMetrics], cfg: FFNConfig, *,
-                      warmup: int, k: int = SLALOM_K) -> None:
+                      warmup: int, k: int = SLALOM_K,
+                      link_gbps: Optional[float] = None) -> None:
     measured = rounds[warmup:] if warmup > 0 else rounds
     rates = [compute_round_rates(r, cfg, k) for r in measured]
 
@@ -517,6 +565,11 @@ def write_json_report(path, rounds: list[RoundMetrics], cfg: FFNConfig, *,
         return float(sum(xs) / len(xs)) if xs else 0.0
 
     mean_e2e_ms = _mean([r.end_to_end_t for r in measured]) or 1e-9
+    wire_payload_bytes = _mean([r.bytes_recv for r in measured])
+    wire_only_ms = _mean(
+        [max(0.0, r.wire_recv_t - r.gpu_forward_t) for r in measured])
+    wire_eff_gbps = (wire_payload_bytes * 8.0 / (wire_only_ms / 1000.0) / 1e9) \
+        if wire_only_ms > 0 else 0.0
     summary = {
         "rounds_total": len(rounds),
         "rounds_warmup": warmup,
@@ -535,6 +588,15 @@ def write_json_report(path, rounds: list[RoundMetrics], cfg: FFNConfig, *,
         "mean_wire_pct": _mean([r["wire_pct"] for r in rates]),
         "mean_verify_pct": _mean([r["verify_pct"] for r in rates]),
         "mean_sum_pct": _mean([r["sum_pct"] for r in rates]),
+        # Shapes/dtypes/sizes of the tensors the worker streams back each round
+        # (constant across rounds; sampled from the first measured round).
+        "wire_tensors": next((r.recv_tensors for r in measured if r.recv_tensors), {}),
+        # Ideal-vs-measured transfer estimate for the per-round payload.
+        "wire_payload_bytes": wire_payload_bytes,
+        "mean_wire_only_ms": wire_only_ms,
+        "mean_wire_effective_gbps": wire_eff_gbps,
+        "link_gbps": link_gbps,
+        "wire_efficiency": (wire_eff_gbps / link_gbps) if link_gbps else None,
     }
     payload = {
         "config": asdict(cfg),
@@ -673,6 +735,11 @@ class Coordinator:
                         f"op_tag={op_tag}: expected shape "
                         f"{self._expected_shape(op_tag)}, got {tuple(tensor.shape)}"
                     )
+                rm.recv_tensors[op_tag] = {
+                    "shape": list(tensor.shape),
+                    "dtype": _DTYPE_NAME[d["dtype_id"]],
+                    "bytes": 8 + len(body),  # framed message size (header + body)
+                }
                 t32 = tensor.to(torch.float32)
                 acts[op_tag] = t32
                 if self.pipeline:
@@ -794,10 +861,11 @@ def run_coordinator(host: str, port: int, args) -> int:
     finally:
         coord.close()
     print(format_summary(rounds, cfg, warmup=args.warmup, k=SLALOM_K,
-                         pipelined=args.pipeline))
+                         pipelined=args.pipeline, link_gbps=args.link_gbps))
     if args.json_report:
         write_json_report(args.json_report, rounds, cfg,
-                          warmup=args.warmup, k=SLALOM_K)
+                          warmup=args.warmup, k=SLALOM_K,
+                          link_gbps=args.link_gbps)
     if args.verbose:
         for r in rounds:
             print(f"r={r.request_id} e2e={r.end_to_end_t:.2f} "
@@ -867,6 +935,10 @@ def main() -> int:
     p.add_argument("--inject-fault", default="none",
                    choices=["none", "flip_y1", "scale_y2", "drop_silu"])
     p.add_argument("--json-report", default=None)
+    p.add_argument("--link-gbps", type=float, default=None,
+                   help="nominal link bandwidth (Gbit/s); adds an ideal-vs-"
+                        "measured transfer comparison and a link-efficiency %% "
+                        "to the summary")
     p.add_argument("--pipeline", action="store_true",
                    help="overlap worker send with compute and coordinator "
                         "verify with receive (sum_pct then exceeds 100%%)")

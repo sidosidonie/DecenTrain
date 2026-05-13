@@ -26,6 +26,7 @@
 #   WIRE_DTYPE   fp16|fp32 on-wire activation dtype (default: fp16)
 #   THRESHOLD    SLALOM MSE threshold               (default: auto: scales with dtype/dims)
 #   JSON_REPORT  path for the per-round JSON report (default: ffn_run.json; empty string disables)
+#   LINK_GBPS    nominal link bandwidth (Gbit/s)    (default: unset; adds ideal-vs-measured + link efficiency)
 #   PIPELINE     1 to enable --pipeline             (default: 0)  -- must match the worker
 #   VERBOSE      1 to print a line per round        (default: 0)
 #   PYTHON       python interpreter                 (default: python)
@@ -66,6 +67,7 @@ ARGS=(examples/multi_machine_ffn.py
       --wire-dtype "${WIRE_DTYPE}")
 [ -n "${THRESHOLD:-}" ] && ARGS+=(--threshold "${THRESHOLD}")
 [ -n "${JSON_REPORT}" ] && ARGS+=(--json-report "${JSON_REPORT}")
+[ -n "${LINK_GBPS:-}" ] && ARGS+=(--link-gbps "${LINK_GBPS}")
 [ "${PIPELINE}" = "1" ] && ARGS+=(--pipeline)
 [ "${VERBOSE}" = "1" ] && ARGS+=(--verbose)
 

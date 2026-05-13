@@ -4,3 +4,8 @@
 .vscode
 output/
 *.egg-info/
+
+# multi-machine FFN example: run artifacts
+ffn_run.json
+fanout_*/
+workers_*/
