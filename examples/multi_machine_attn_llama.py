@@ -109,3 +109,53 @@ def make_attn_weights(
     v = _lin(cfg.hidden, cfg.kv_heads * cfg.head_dim, offset=2)
     o = _lin(cfg.heads * cfg.head_dim, cfg.hidden,    offset=3)
     return q, k, v, o
+
+
+# ── repeat_kv (HF compat) ───────────────────────────────────────────
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    b, h, s, d = hidden_states.shape
+    expanded = hidden_states[:, :, None, :, :].expand(b, h, n_rep, s, d)
+    return expanded.reshape(b, h * n_rep, s, d)
+
+
+# ── Causal mask ─────────────────────────────────────────────────────
+def causal_mask(seq: int, device, dtype) -> torch.Tensor:
+    return torch.triu(
+        torch.full((seq, seq), float("-inf"), device=device, dtype=dtype),
+        diagonal=1,
+    )
+
+
+# ── Forward compute (shared by Worker.GPU and Coordinator-recompute paths) ──
+def compute_attn_forward(
+    x: torch.Tensor,
+    q_proj: nn.Linear, k_proj: nn.Linear, v_proj: nn.Linear, o_proj: nn.Linear,
+    cos: torch.Tensor, sin: torch.Tensor, cfg: AttnLlamaConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the full attention forward and return (q_raw, k_raw, v_raw, output).
+
+    Only the "raw" linear outputs cross the wire — `attn_out` is recomputed
+    on the coordinator from the verified q/k/v.
+    """
+    B, S = cfg.batch, cfg.seq
+    q_raw = q_proj(x)
+    k_raw = k_proj(x)
+    v_raw = v_proj(x)
+
+    q = q_raw.view(B, S, cfg.heads,    cfg.head_dim).transpose(1, 2)
+    k = k_raw.view(B, S, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
+    v = v_raw.view(B, S, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
+
+    q, k = apply_rope_llama(q, k, cos.to(q.dtype), sin.to(q.dtype))
+    k = repeat_kv(k, cfg.num_kv_groups)
+    v = repeat_kv(v, cfg.num_kv_groups)
+
+    scale = cfg.head_dim ** -0.5
+    scores = q @ k.transpose(-2, -1) * scale
+    scores = scores + causal_mask(S, scores.device, scores.dtype)
+    probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)
+    attn_out = (probs @ v).transpose(1, 2).contiguous().reshape(B, S, cfg.hidden)
+    output = o_proj(attn_out)
+    return q_raw, k_raw, v_raw, output
