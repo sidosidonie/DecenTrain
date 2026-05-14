@@ -166,3 +166,69 @@ def test_slalom_verify_fails_for_forged_y():
     s_tilde = m.precompute_s_tilde(W, s)
     mse = m.slalom_verify(x, y_forged, s, s_tilde)
     assert mse > 1.0
+
+
+def test_rope_llama_round_trip_against_hf():
+    """Our apply_rope_llama matches HF apply_rotary_pos_emb."""
+    m = _load_common()
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+    head_dim, max_seq = 64, 32
+    cos, sin = m.precompute_rope_cos_sin(head_dim, max_seq, base=500000.0)
+    assert cos.shape == (max_seq, head_dim)
+    assert sin.shape == (max_seq, head_dim)
+
+    torch.manual_seed(0)
+    B, H, S, D = 2, 4, max_seq, head_dim
+    q = torch.randn(B, H, S, D)
+    k = torch.randn(B, H, S, D)
+    q_ours, k_ours = m.apply_rope_llama(q, k, cos, sin)
+
+    # HF expects (cos, sin) shaped (1, S, D) or (B, S, D)
+    cos_hf = cos.unsqueeze(0)
+    sin_hf = sin.unsqueeze(0)
+    q_hf, k_hf = apply_rotary_pos_emb(q, k, cos_hf, sin_hf)
+    assert torch.allclose(q_ours, q_hf, atol=1e-5)
+    assert torch.allclose(k_ours, k_hf, atol=1e-5)
+
+
+def test_rope_zimage_complex_cis_matches_reference():
+    """Our apply_rotary_emb_zimage matches the verified_diffusers impl."""
+    m = _load_common()
+    from verified_diffusers.zimage.attention import apply_rotary_emb
+
+    head_dim, max_seq = 64, 16
+    freqs = m.precompute_zimage_freqs_cis(head_dim, max_seq, theta=10000.0)
+    assert freqs.shape == (max_seq, head_dim // 2)
+    assert freqs.dtype == torch.complex64 or freqs.dtype == torch.complex128
+
+    torch.manual_seed(1)
+    B, S, H, D = 2, max_seq, 4, head_dim
+    x = torch.randn(B, S, H, D)
+    out_ours = m.apply_rotary_emb_zimage(x, freqs)
+    # Reference expects freqs shape (S, D/2) and applies it via complex math
+    out_ref = apply_rotary_emb(x, freqs)
+    assert torch.allclose(out_ours.float(), out_ref.float(), atol=1e-5)
+
+
+def test_rmsnorm_cpu_matches_torch():
+    m = _load_common()
+    torch.manual_seed(2)
+    x = torch.randn(2, 3, 16)
+    weight = torch.randn(16)
+    eps = 1e-6
+
+    # No scale_offset → standard RMSNorm: x * rsqrt(mean(x^2) + eps) * weight
+    out = m.rmsnorm_cpu(x, weight, eps, scale_offset=0.0)
+    ref = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps) * weight
+    assert torch.allclose(out, ref, atol=1e-6)
+
+    # scale_offset=1.0 → Qwen3-style (1.0 + weight)
+    out2 = m.rmsnorm_cpu(x, weight, eps, scale_offset=1.0)
+    ref2 = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps) * (1.0 + weight)
+    assert torch.allclose(out2, ref2, atol=1e-6)
+
+    # weight=None: identity scale
+    out3 = m.rmsnorm_cpu(x, None, eps, scale_offset=0.0)
+    ref3 = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    assert torch.allclose(out3, ref3, atol=1e-6)

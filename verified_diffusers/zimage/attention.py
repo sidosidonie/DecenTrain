@@ -30,7 +30,9 @@ from verified_core.verify_linear import freivalds_batch_matmul, slalom_verify_pr
 def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     with torch.amp.autocast("cuda", enabled=False):
         x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(2)
+        # unsqueeze(-2) inserts a head-broadcast dim regardless of whether
+        # freqs_cis is 2-D (S, D/2) or 3-D (B, S, D/2).
+        freqs_cis = freqs_cis.unsqueeze(-2)
         x_out = torch.view_as_real(x * freqs_cis).flatten(3)
         return x_out.type_as(x_in)
 
@@ -38,7 +40,7 @@ def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tenso
 def _apply_rotary_emb_cpu(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """CPU version of apply_rotary_emb."""
     x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
-    fc = freqs_cis.unsqueeze(2)
+    fc = freqs_cis.unsqueeze(-2)
     x_out = torch.view_as_real(x * fc).flatten(3)
     return x_out
 

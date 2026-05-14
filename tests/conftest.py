@@ -16,8 +16,18 @@ Two system-level incompatibilities are fixed here:
    import cleanly; diffusers then auto-detects no working flash-attn backend
    and falls back to the native SDPA implementation.
 """
+import pathlib
 import sys
 import types
+
+# ---------------------------------------------------------------------------
+# Ensure the repo root is on sys.path so that local packages (verified_core,
+# verified_diffusers, verified_llm, …) are importable regardless of how pytest
+# is invoked (e.g. from a subdirectory or via conda run).
+# ---------------------------------------------------------------------------
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # ---------------------------------------------------------------------------
 # Fix 1: stub torchvision._meta_registrations
