@@ -48,7 +48,7 @@ from _multi_machine_common import (                                     # noqa: 
     launch_loopback_worker, cleanup_loopback_worker, make_s, pack_tensor,
     pick_free_port, precompute_rope_cos_sin, precompute_s_tilde,
     prepare_tensor_send, recv_msg, send_msg, send_tensor,
-    slalom_verify, slalom_verify_safe, tune_socket,
+    slalom_verify, slalom_verify_safe,
     unpack_tensor, wait_port,
 )
 
@@ -254,7 +254,6 @@ class Worker:
         try:
             while True:
                 sock, addr = srv.accept()
-                tune_socket(sock)  # TCP_NODELAY + larger SO_SNDBUF/SO_RCVBUF
                 self._log(f"connection from {addr[0]}:{addr[1]}")
                 try:
                     handled = self._serve_session(sock)
@@ -471,7 +470,6 @@ class Coordinator:
 
     def connect_and_load(self) -> None:
         self.sock = socket.create_connection((self.host, self.port), timeout=30)
-        tune_socket(self.sock)  # match the worker's TCP_NODELAY + SO_*BUF
         body = pack_load_req(
             hidden=self.config.hidden, heads=self.config.heads,
             kv_heads=self.config.kv_heads, head_dim=self.config.head_dim,
