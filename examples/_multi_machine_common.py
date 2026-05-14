@@ -61,40 +61,6 @@ def send_msg(sock: socket.socket, msg_type: int, body: bytes) -> int:
     return len(header) + len(body)
 
 
-def _sendmsg_all(sock: socket.socket, buffers) -> None:
-    """sendmsg loop that handles partial sends without copying."""
-    # Normalize to a list of byte-format memoryviews so slicing is zero-copy.
-    bufs = []
-    for b in buffers:
-        mv = b if isinstance(b, memoryview) else memoryview(b)
-        if mv.format != "B" or mv.ndim != 1:
-            mv = mv.cast("B")
-        if mv.nbytes:
-            bufs.append(mv)
-    while bufs:
-        sent = sock.sendmsg(bufs)
-        while bufs and sent >= bufs[0].nbytes:
-            sent -= bufs[0].nbytes
-            bufs.pop(0)
-        if bufs and sent:
-            bufs[0] = bufs[0][sent:]
-
-
-def tune_socket(sock: socket.socket) -> None:
-    """TCP_NODELAY only. Both peers should call it.
-
-    Intentionally does NOT set SO_SNDBUF/SO_RCVBUF: doing so disables
-    Linux TCP autotuning, which grows the window up to net.ipv4.tcp_*mem[2]
-    (typically 4-32 MB). An explicit setsockopt is also clamped by
-    net.core.[rw]mem_max, which on stock kernels is ~208 KB -- much
-    smaller than what autotune would reach on its own.
-    """
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except OSError:
-        pass
-
-
 def recv_msg(sock: socket.socket) -> tuple[int, bytes]:
     """Read one framed message. Returns (msg_type, body)."""
     header = recv_exactly(sock, 8)
@@ -123,43 +89,6 @@ def pack_tensor(request_id: int, op_tag: int, tensor: torch.Tensor,
     header = struct.pack(_TENSOR_HDR_FMT, request_id, op_tag,
                          wire_dtype_id, ndim)
     return header + shape_bytes + payload
-
-
-def prepare_tensor_send(request_id: int, op_tag: int, tensor: torch.Tensor,
-                        wire_dtype_id: int) -> tuple[list, int]:
-    """Build the iovec for a zero-copy MSG_TENSOR send.
-
-    Returns (buffers, total_bytes). `buffers` is a list of bytes/memoryview
-    objects suitable for socket.sendmsg() — frame header, tensor header,
-    shape bytes, then a memoryview directly over the tensor's CPU storage.
-    No 4 MB header+payload concatenation is performed (vs. pack_tensor +
-    send_msg, which copies the payload twice).
-
-    The caller must hold the returned buffers list until the send completes;
-    its memoryview keeps the underlying numpy/torch storage alive.
-    """
-    np_dtype = _NUMPY_DTYPE[wire_dtype_id]
-    torch_dtype = _TORCH_DTYPE[wire_dtype_id]
-    t = tensor.detach().to(torch_dtype).contiguous().cpu()
-    arr = t.numpy()
-    if arr.dtype != np.dtype(np_dtype):
-        arr = arr.astype(np_dtype, copy=False)
-    payload = memoryview(arr).cast("B")
-    ndim = t.ndim
-    tensor_hdr = struct.pack(_TENSOR_HDR_FMT, request_id, op_tag,
-                             wire_dtype_id, ndim)
-    shape_bytes = struct.pack(f"<{ndim}I", *t.shape)
-    body_len = len(tensor_hdr) + len(shape_bytes) + payload.nbytes
-    frame = struct.pack("<II", MSG_TENSOR, body_len)
-    return [frame, tensor_hdr, shape_bytes, payload], 8 + body_len
-
-
-def send_tensor(sock: socket.socket, request_id: int, op_tag: int,
-                tensor: torch.Tensor, wire_dtype_id: int) -> int:
-    """Sequential convenience wrapper for prepare_tensor_send + sendmsg."""
-    bufs, total = prepare_tensor_send(request_id, op_tag, tensor, wire_dtype_id)
-    _sendmsg_all(sock, bufs)
-    return total
 
 
 def unpack_tensor(body: bytes) -> dict:

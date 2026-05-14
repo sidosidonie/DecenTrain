@@ -43,12 +43,10 @@ from _multi_machine_common import (                                     # noqa: 
     MSG_LOAD_ACK, MSG_LOAD_REQ, MSG_TENSOR,
     RoundMetricsBase, SLALOM_K, S_GENERATOR_SEED, WireProtocolError,
     _DTYPE_NAME, _DTYPE_SIZE, _NAME_TO_DTYPE, _TORCH_DTYPE,
-    _sendmsg_all,
     apply_rope_llama, default_slalom_threshold, format_summary,
     launch_loopback_worker, cleanup_loopback_worker, make_s, pack_tensor,
     pick_free_port, precompute_rope_cos_sin, precompute_s_tilde,
-    prepare_tensor_send, recv_msg, send_msg, send_tensor,
-    slalom_verify, slalom_verify_safe,
+    recv_msg, send_msg, slalom_verify, slalom_verify_safe,
     unpack_tensor, wait_port,
 )
 
@@ -340,11 +338,10 @@ class Worker:
             self._send_pipelined(sock, request_id,
                                  q_raw, k_raw, v_raw, output, gpu_t_ms)
         else:
-            # Zero-copy sendmsg path: avoids the ~4 MB header+payload memcpy
-            # that pack_tensor + send_msg would do per tensor.
             for tag, t in ((OP_Q, q_raw), (OP_K, k_raw),
                            (OP_V, v_raw), (OP_O, output)):
-                send_tensor(sock, request_id, tag, t, self.wire_dtype_id)
+                send_msg(sock, MSG_TENSOR,
+                         pack_tensor(request_id, tag, t, self.wire_dtype_id))
             send_msg(sock, MSG_FORWARD_DONE,
                      pack_forward_done(request_id, gpu_t_ms))
 
@@ -358,9 +355,6 @@ class Worker:
                   f"{self.device.type}, sent {sent_mb:.2f} MB ({mode}){fault}")
 
     def _send_pipelined(self, sock, request_id, q, k, v, o, gpu_t_ms) -> None:
-        """Pipelined send: sender thread sendmsg's tensor N while main thread
-        prepares (D2H + dtype) tensor N+1. Combines with zero-copy sendmsg so
-        each tensor is shipped without any header/payload concatenation."""
         send_q: queue.Queue = queue.Queue()
         sender_exc: list = []
 
@@ -370,23 +364,17 @@ class Worker:
                     item = send_q.get()
                     if item is None:
                         return
-                    kind, payload = item
-                    if kind == "iov":   # list of buffers ready for sendmsg
-                        _sendmsg_all(sock, payload)
-                    else:               # ("msg", (mtype, body))
-                        mtype, body = payload
-                        send_msg(sock, mtype, body)
+                    mtype, body = item
+                    send_msg(sock, mtype, body)
             except Exception as e:
                 sender_exc.append(e)
 
         t = threading.Thread(target=_sender, daemon=True)
         t.start()
         for tag, ten in ((OP_Q, q), (OP_K, k), (OP_V, v), (OP_O, o)):
-            bufs, _ = prepare_tensor_send(
-                request_id, tag, ten, self.wire_dtype_id)
-            send_q.put(("iov", bufs))
-        send_q.put(("msg", (MSG_FORWARD_DONE,
-                             pack_forward_done(request_id, gpu_t_ms))))
+            send_q.put((MSG_TENSOR,
+                        pack_tensor(request_id, tag, ten, self.wire_dtype_id)))
+        send_q.put((MSG_FORWARD_DONE, pack_forward_done(request_id, gpu_t_ms)))
         send_q.put(None)
         t.join()
         if sender_exc:
