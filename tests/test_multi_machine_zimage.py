@@ -153,3 +153,72 @@ def test_zimage_worker_load_round_trip():
     t.join(2.0)
     assert worker.n_layers == cfg_kwargs["n_layers"]
     assert len(worker.blocks) == cfg_kwargs["n_layers"]
+
+
+def test_zimage_loopback_round_passes_with_no_fault():
+    m = _load()
+    cfg = m.ZimageConfig(dim=16, heads=2, head_dim=8, ffn_inter=32,
+                         n_layers=2, batch=1, seq=4,
+                         wire_dtype=m.DTYPE_FP32, weight_seed=11)
+    port = m.pick_free_port()
+    worker = m.Worker(bind_host="127.0.0.1", bind_port=port, device="cpu",
+                      inject_fault="none", stream=False, quiet=True)
+    t = threading.Thread(target=worker.serve_once, daemon=True)
+    t.start()
+    m.wait_port(port, timeout=3.0)
+
+    coord = m.Coordinator(host="127.0.0.1", port=port, config=cfg,
+                          threshold=1e-3, k=m.SLALOM_K)
+    try:
+        coord.connect_and_load()
+        rm = coord.run_round(request_id=1, input_seed=1234)
+    finally:
+        coord.close()
+    t.join(2.0)
+
+    assert rm.ok is True
+    assert rm.bytes_recv == rm.bytes_recv_predicted
+    # Per-block per-op MSE all under threshold
+    for b in range(cfg.n_layers):
+        for kind in (m.OP_Q, m.OP_K, m.OP_V, m.OP_O, m.OP_W1, m.OP_W3, m.OP_W2):
+            tag = m.make_op_tag(b, kind)
+            assert rm.mse[tag] < 1e-3, f"block {b} kind {kind} mse={rm.mse[tag]}"
+
+
+def test_zimage_loopback_subprocess_smoke():
+    out = subprocess.run(
+        [sys.executable, str(EXAMPLE_PATH),
+         "--role", "loopback", "--device", "cpu",
+         "--dim", "16", "--heads", "2", "--head-dim", "8",
+         "--ffn-inter", "32", "--n-layers", "2",
+         "--batch", "1", "--seq", "4",
+         "--wire-dtype", "fp32", "--rounds", "5", "--warmup", "1"],
+        capture_output=True, timeout=120, text=True,
+    )
+    assert out.returncode == 0, f"stderr:\n{out.stderr}"
+    assert "rounds passed     4 / 4" in out.stdout
+
+
+def test_zimage_loopback_subprocess_block_propagation():
+    """A scale_o fault at block 0 must also poison block 1's MSE."""
+    out = subprocess.run(
+        [sys.executable, str(EXAMPLE_PATH),
+         "--role", "loopback", "--device", "cpu",
+         "--dim", "16", "--heads", "2", "--head-dim", "8",
+         "--ffn-inter", "32", "--n-layers", "2",
+         "--batch", "1", "--seq", "4",
+         "--wire-dtype", "fp32", "--rounds", "1", "--warmup", "0",
+         "--inject-fault", "scale_o", "--fault-block", "0",
+         "--threshold", "1e-10"],
+        capture_output=True, timeout=120, text=True,
+    )
+    assert out.returncode == 0
+    assert "rounds passed     0 / 1" in out.stdout
+    # Both block 0 (where fault was injected) and block 1 (where verified
+    # x_in_for_next diverges from worker's x_in_for_next) must show high MSE
+    # on at least one op_kind. We verify by checking the printed mse summary
+    # contains TWO different "p95" entries with values > 1e-14.
+    high_mse = sum(1 for line in out.stdout.splitlines()
+                   if "mse[" in line and "p95" in line
+                   and float(line.rsplit()[-1]) > 1e-14)
+    assert high_mse >= 2, f"expected ≥2 high-mse ops, got {high_mse}\n{out.stdout}"
