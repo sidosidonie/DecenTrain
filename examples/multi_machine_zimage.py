@@ -215,3 +215,230 @@ def compute_zimage_stack_forward(
         outs, x = compute_zimage_block_forward(x, blocks[b], freqs_cis, cfg)
         block_outs.append(outs)
     return block_outs, x
+
+
+# ── Wire message bodies ─────────────────────────────────────────────
+# LOAD_REQ body: <I I I I I I I B B>
+#   dim, heads, head_dim, ffn_inter, n_layers, weight_seed, rope_theta_e3,
+#   qk_norm_id, dtype_id
+_LOAD_REQ_FMT = "<IIIIIIIBB"
+
+
+def pack_load_req(dim: int, heads: int, head_dim: int, ffn_inter: int,
+                  n_layers: int, weight_seed: int, rope_theta_e3: int,
+                  qk_norm_id: int, dtype_id: int) -> bytes:
+    return struct.pack(_LOAD_REQ_FMT, dim, heads, head_dim, ffn_inter,
+                       n_layers, weight_seed, rope_theta_e3,
+                       qk_norm_id, dtype_id)
+
+
+def unpack_load_req(body: bytes) -> dict:
+    (d, h, hd, fi, nl, seed, theta_e3, qkn, dtype) = struct.unpack(
+        _LOAD_REQ_FMT, body)
+    return {"dim": d, "heads": h, "head_dim": hd, "ffn_inter": fi,
+            "n_layers": nl, "weight_seed": seed,
+            "rope_theta": theta_e3 / 1000.0,
+            "qk_norm": "rms" if qkn == 1 else "none",
+            "dtype_id": dtype}
+
+
+def pack_load_ack(status: int) -> bytes:
+    return struct.pack("<B", status)
+
+
+def unpack_load_ack(body: bytes) -> dict:
+    return {"status": struct.unpack("<B", body)[0]}
+
+
+_FWD_REQ_FMT = "<QIII"
+
+
+def pack_forward_req(request_id: int, input_seed: int,
+                     batch: int, seq: int) -> bytes:
+    return struct.pack(_FWD_REQ_FMT, request_id, input_seed, batch, seq)
+
+
+def unpack_forward_req(body: bytes) -> dict:
+    rid, seed, b, s = struct.unpack(_FWD_REQ_FMT, body)
+    return {"request_id": rid, "input_seed": seed, "batch": b, "seq": s}
+
+
+def pack_forward_done(request_id: int, gpu_t_ms: float) -> bytes:
+    return struct.pack("<Qd", request_id, gpu_t_ms)
+
+
+def unpack_forward_done(body: bytes) -> dict:
+    rid, t = struct.unpack("<Qd", body)
+    return {"request_id": rid, "gpu_forward_t_ms": t}
+
+
+# ── Worker ──────────────────────────────────────────────────────────
+class Worker:
+    def __init__(self, bind_host: str, bind_port: int, device: str,
+                 inject_fault: str = "none", fault_block: int = 0,
+                 stream: bool = True, quiet: bool = False):
+        self.bind_host = bind_host; self.bind_port = bind_port
+        self.device = torch.device(device)
+        self.inject_fault = inject_fault
+        self.fault_block = fault_block
+        self.stream = stream; self.quiet = quiet
+        self.blocks: list[BlockWeights] = []
+        self.dim = self.heads = self.head_dim = self.ffn_inter = 0
+        self.n_layers = 0
+        self.qk_norm = "rms"; self.rope_theta = 10000.0
+        self.wire_dtype_id = DTYPE_FP16
+        self.compute_dtype = torch.float16
+        self.cfg: Optional[ZimageConfig] = None
+        self._round_count = 0
+
+    def _log(self, msg: str) -> None:
+        if self.quiet:
+            return
+        print(f"[zi-worker {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    def serve_once(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((self.bind_host, self.bind_port))
+        srv.listen(8)
+        self._log(f"listening on {self.bind_host}:{self.bind_port}  "
+                  f"device={self.device}  fault={self.inject_fault}@b{self.fault_block}")
+        try:
+            while True:
+                sock, addr = srv.accept()
+                self._log(f"connection from {addr[0]}:{addr[1]}")
+                try:
+                    handled = self._serve_session(sock)
+                finally:
+                    sock.close()
+                if handled:
+                    return
+        finally:
+            srv.close()
+
+    def _serve_session(self, sock) -> bool:
+        handled = False
+        while True:
+            try:
+                mt, body = recv_msg(sock)
+            except (ConnectionError, OSError):
+                return handled
+            handled = True
+            if mt == MSG_LOAD_REQ:
+                self._handle_load(sock, unpack_load_req(body))
+            elif mt == MSG_FORWARD_REQ:
+                self._handle_forward(sock, unpack_forward_req(body))
+            elif mt == MSG_CLOSE:
+                return handled
+            else:
+                raise WireProtocolError(f"unexpected msg_type {mt}")
+
+    def _handle_load(self, sock, fields: dict) -> None:
+        self.dim = fields["dim"]; self.heads = fields["heads"]
+        self.head_dim = fields["head_dim"]; self.ffn_inter = fields["ffn_inter"]
+        self.n_layers = fields["n_layers"]
+        self.qk_norm = fields["qk_norm"]; self.rope_theta = fields["rope_theta"]
+        self.wire_dtype_id = fields["dtype_id"]
+        self.compute_dtype = _TORCH_DTYPE[self.wire_dtype_id]
+        self.cfg = ZimageConfig(
+            dim=self.dim, heads=self.heads, head_dim=self.head_dim,
+            ffn_inter=self.ffn_inter, n_layers=self.n_layers,
+            batch=1, seq=1, qk_norm=self.qk_norm, rope_theta=self.rope_theta,
+            wire_dtype=self.wire_dtype_id, weight_seed=fields["weight_seed"])
+        self.blocks = make_zimage_block_weights(
+            self.cfg, dtype=self.compute_dtype, device=self.device)
+        send_msg(sock, MSG_LOAD_ACK, pack_load_ack(0))
+        self._log(f"LOAD: dim={self.dim} n_layers={self.n_layers} "
+                  f"ffn_inter={self.ffn_inter}")
+
+    def _handle_forward(self, sock, fields: dict) -> None:
+        rid = fields["request_id"]; seed = fields["input_seed"]
+        B, S = fields["batch"], fields["seq"]
+        cfg = ZimageConfig(
+            dim=self.dim, heads=self.heads, head_dim=self.head_dim,
+            ffn_inter=self.ffn_inter, n_layers=self.n_layers,
+            batch=B, seq=S, qk_norm=self.qk_norm, rope_theta=self.rope_theta,
+            wire_dtype=self.wire_dtype_id, weight_seed=self.cfg.weight_seed)
+        freqs = precompute_zimage_freqs_cis(self.head_dim, S, theta=self.rope_theta)
+
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        x_cpu = torch.randn(B, S, self.dim, dtype=torch.float32, generator=gen)
+        x = x_cpu.to(device=self.device, dtype=self.compute_dtype)
+
+        # Optional streaming sender thread
+        send_q: Optional[queue.Queue] = None
+        sender_t: Optional[threading.Thread] = None
+        sender_exc: list = []
+        if self.stream:
+            send_q = queue.Queue()
+
+            def _sender():
+                try:
+                    while True:
+                        item = send_q.get()
+                        if item is None:
+                            return
+                        mtype, body = item
+                        send_msg(sock, mtype, body)
+                except Exception as e:
+                    sender_exc.append(e)
+
+            sender_t = threading.Thread(target=_sender, daemon=True)
+            sender_t.start()
+
+        t0 = time.perf_counter()
+        x_in = x
+        for b in range(self.n_layers):
+            outs, x_in = compute_zimage_block_forward(
+                x_in, self.blocks[b], freqs, cfg)
+            outs = self._apply_fault_for_block(b, outs, x_in, freqs, cfg)
+            for kind in (OP_Q, OP_K, OP_V, OP_O, OP_W1, OP_W3, OP_W2):
+                tag = make_op_tag(b, kind)
+                body = pack_tensor(rid, tag, outs[kind], self.wire_dtype_id)
+                if self.stream:
+                    send_q.put((MSG_TENSOR, body))
+                else:
+                    send_msg(sock, MSG_TENSOR, body)
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        gpu_t = (time.perf_counter() - t0) * 1000.0
+
+        if self.stream:
+            send_q.put((MSG_FORWARD_DONE, pack_forward_done(rid, gpu_t)))
+            send_q.put(None)
+            sender_t.join()
+            if sender_exc:
+                raise sender_exc[0]
+        else:
+            send_msg(sock, MSG_FORWARD_DONE, pack_forward_done(rid, gpu_t))
+
+        self._round_count += 1
+        fault = (f"  [INJECTED FAULT: {self.inject_fault}@b{self.fault_block}]"
+                 if self.inject_fault != "none" else "")
+        mode = "streamed" if self.stream else "sequential"
+        self._log(f"round #{self._round_count} (req {rid}): "
+                  f"x[{B},{S},{self.dim}] N={self.n_layers} forward "
+                  f"{gpu_t:.2f} ms ({mode}){fault}")
+
+    def _apply_fault_for_block(self, b: int, outs: dict, x_in_for_next, freqs, cfg
+                                ) -> dict:
+        if self.inject_fault == "none" or b != self.fault_block:
+            return outs
+        if self.inject_fault == "flip_v":
+            outs[OP_V] = -outs[OP_V]
+        elif self.inject_fault == "scale_o":
+            outs[OP_O] = outs[OP_O] * 2.0
+        elif self.inject_fault == "scale_w2":
+            outs[OP_W2] = outs[OP_W2] * 2.0
+        elif self.inject_fault == "flip_w1":
+            outs[OP_W1] = -outs[OP_W1]
+        elif self.inject_fault == "drop_silu":
+            # We can't easily reconstruct here without the gated input;
+            # mark outs[OP_W2] as bw.w2(w1*w3) — caught by w2 SLALOM.
+            bw = self.blocks[b]
+            gated_bad = outs[OP_W1] * outs[OP_W3]                 # missing silu
+            outs[OP_W2] = bw.w2(gated_bad)
+        else:
+            raise ValueError(f"unknown inject_fault: {self.inject_fault}")
+        return outs

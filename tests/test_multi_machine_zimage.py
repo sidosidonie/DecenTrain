@@ -121,3 +121,35 @@ def test_compute_zimage_block_forward_matches_reference():
         x = x_after + w2o
 
     assert torch.allclose(x_out, x, atol=1e-4)
+
+
+def test_zimage_worker_load_round_trip():
+    m = _load()
+    cfg_kwargs = dict(dim=16, heads=2, head_dim=8, ffn_inter=32, n_layers=2,
+                      batch=1, seq=4, weight_seed=7)
+    port = m.pick_free_port()
+    worker = m.Worker(bind_host="127.0.0.1", bind_port=port, device="cpu",
+                      inject_fault="none", fault_block=0, stream=False,
+                      quiet=True)
+    t = threading.Thread(target=worker.serve_once, daemon=True)
+    t.start()
+    m.wait_port(port, timeout=3.0)
+
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    body = m.pack_load_req(
+        dim=cfg_kwargs["dim"], heads=cfg_kwargs["heads"],
+        head_dim=cfg_kwargs["head_dim"], ffn_inter=cfg_kwargs["ffn_inter"],
+        n_layers=cfg_kwargs["n_layers"],
+        weight_seed=cfg_kwargs["weight_seed"],
+        rope_theta_e3=int(10000.0 * 1000),
+        qk_norm_id=1, dtype_id=m.DTYPE_FP32,
+    )
+    m.send_msg(sock, m.MSG_LOAD_REQ, body)
+    mt, ack = m.recv_msg(sock)
+    assert mt == m.MSG_LOAD_ACK
+    assert m.unpack_load_ack(ack)["status"] == 0
+    m.send_msg(sock, m.MSG_CLOSE, b"")
+    sock.close()
+    t.join(2.0)
+    assert worker.n_layers == cfg_kwargs["n_layers"]
+    assert len(worker.blocks) == cfg_kwargs["n_layers"]
