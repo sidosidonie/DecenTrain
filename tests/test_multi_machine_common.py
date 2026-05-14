@@ -232,3 +232,56 @@ def test_rmsnorm_cpu_matches_torch():
     out3 = m.rmsnorm_cpu(x, None, eps, scale_offset=0.0)
     ref3 = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
     assert torch.allclose(out3, ref3, atol=1e-6)
+
+
+def test_round_metrics_base_defaults():
+    m = _load_common()
+    rm = m.RoundMetricsBase(request_id=5)
+    assert rm.request_id == 5
+    assert rm.gpu_forward_t == 0.0
+    assert rm.bytes_recv == 0
+    assert rm.recv_tensors == {}
+    assert rm.mse == {}
+    assert rm.cpu_verify_per_op_t == {}
+    assert rm.ok is True
+
+
+def test_default_slalom_threshold_fp32():
+    m = _load_common()
+    assert m.default_slalom_threshold(m.DTYPE_FP32, in_dim=1024) == 1e-3
+    assert m.default_slalom_threshold(m.DTYPE_FP32, in_dim=4096) == 1e-3
+
+
+def test_default_slalom_threshold_fp16_scales_with_dim():
+    m = _load_common()
+    t_small = m.default_slalom_threshold(m.DTYPE_FP16, in_dim=128)
+    t_large = m.default_slalom_threshold(m.DTYPE_FP16, in_dim=11008)
+    assert t_small == max(1e-3, 128 * 2e-6)
+    assert t_large == max(1e-3, 11008 * 2e-6)
+    assert t_large > t_small
+
+
+def test_default_slalom_threshold_custom_slope():
+    m = _load_common()
+    t = m.default_slalom_threshold(m.DTYPE_FP16, in_dim=4096, fp16_slope=4e-6)
+    assert t == max(1e-3, 4096 * 4e-6)
+
+
+def test_format_summary_basic_smoke():
+    m = _load_common()
+    rounds = [
+        m.RoundMetricsBase(request_id=i, end_to_end_t=10.0, gpu_forward_t=3.0,
+                           wire_recv_t=4.0, cpu_verify_t=2.0,
+                           bytes_recv=1000, bytes_recv_predicted=1000,
+                           mse={1: 1e-7, 2: 1e-7}, ok=True)
+        for i in range(5)
+    ]
+    op_names = {1: "q", 2: "o"}
+    s = m.format_summary(rounds, warmup=1, pipelined=False,
+                         op_names=op_names,
+                         config_lines=["foo: bar"],
+                         link_gbps=None)
+    assert "End-to-end" in s
+    assert "rounds passed" in s
+    assert "foo: bar" in s
+    assert "q" in s and "o" in s

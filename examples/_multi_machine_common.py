@@ -223,3 +223,124 @@ def rmsnorm_cpu(
     if weight is not None:
         out = out * (scale_offset + weight.float())
     return out.to(x.dtype)
+
+
+# ── Metrics ─────────────────────────────────────────────────────────
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RoundMetricsBase:
+    request_id: int
+    coord_send_t: float = 0.0
+    gpu_forward_t: float = 0.0
+    wire_recv_t: float = 0.0
+    cpu_verify_t: float = 0.0
+    end_to_end_t: float = 0.0
+    bytes_sent: int = 0
+    bytes_recv: int = 0
+    bytes_recv_predicted: int = 0
+    recv_tensors: dict = field(default_factory=dict)
+    mse: dict = field(default_factory=dict)
+    cpu_verify_per_op_t: dict = field(default_factory=dict)
+    ok: bool = True
+
+
+# ── Threshold ───────────────────────────────────────────────────────
+def default_slalom_threshold(
+    wire_dtype_id: int, in_dim: int,
+    *, floor: float = 1e-3, fp16_slope: float = 2e-6,
+) -> float:
+    """Pick an MSE threshold above the wire's numeric noise floor."""
+    if wire_dtype_id == DTYPE_FP32:
+        return 1e-3
+    return max(floor, in_dim * fp16_slope)
+
+
+# ── Summary formatter ───────────────────────────────────────────────
+def _percentile(xs: list[float], q: float) -> float:
+    if not xs:
+        return 0.0
+    return float(np.percentile(xs, q))
+
+
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def format_summary(
+    rounds: list, *, warmup: int, pipelined: bool,
+    op_names: dict[int, str],
+    config_lines: list[str] = (),
+    link_gbps: Optional[float] = None,
+    title: str = "Multi-Machine Example",
+) -> str:
+    """Render a perf-and-verify summary. Op-tag-agnostic."""
+    measured = rounds[warmup:] if warmup > 0 else rounds
+    if not measured:
+        return "(no rounds measured after warmup)"
+    e2e = [r.end_to_end_t for r in measured]
+    gpu = [r.gpu_forward_t for r in measured]
+    wire = [r.wire_recv_t for r in measured]
+    verify = [r.cpu_verify_t for r in measured]
+    passed = sum(1 for r in measured if r.ok)
+    mean_e2e_s = _mean(e2e) / 1000.0
+    bytes_recv_mb = _mean([r.bytes_recv for r in measured]) / 1e6
+    bytes_pred_mb = _mean([r.bytes_recv_predicted for r in measured]) / 1e6
+    wire_only_ms = _mean(
+        [max(0.0, r.wire_recv_t - r.gpu_forward_t) for r in measured])
+
+    # Per-op MSE p95 across the measured rounds
+    all_op_tags = sorted({tag for r in measured for tag in r.mse.keys()})
+    mse_lines = ""
+    for tag in all_op_tags:
+        vals = [r.mse[tag] for r in measured if tag in r.mse]
+        name = op_names.get(tag, f"op{tag}")
+        mse_lines += f"  mse[{name:<12}] p95   {_percentile(vals, 95):.2e}\n"
+
+    cfg_block = "\n".join(f"  {line}" for line in config_lines)
+
+    # Wire estimate
+    payload_bits = bytes_recv_mb * 1e6 * 8.0
+    eff_gbps = (payload_bits / (wire_only_ms / 1000.0) / 1e9) if wire_only_ms > 0 else 0.0
+    ref_gbps = [1.0, 10.0, 25.0]
+    if link_gbps and not any(abs(g - link_gbps) < 1e-9 for g in ref_gbps):
+        ref_gbps = sorted(ref_gbps + [link_gbps])
+
+    def _ideal_ms(g):
+        return payload_bits / (g * 1e9) * 1000.0 if g > 0 else 0.0
+
+    wire_lines = (
+        f"  measured            {wire_only_ms:8.2f} ms  "
+        f"→  {eff_gbps:6.2f} Gbit/s effective\n"
+    )
+    for g in ref_gbps:
+        tag = "   ← --link-gbps" if link_gbps and abs(g - link_gbps) < 1e-9 else ""
+        wire_lines += f"  @ {g:g} Gbit/s ideal  {_ideal_ms(g):8.2f} ms{tag}\n"
+    if link_gbps:
+        wire_lines += (f"  link efficiency     "
+                       f"{eff_gbps / link_gbps * 100:8.1f} %   "
+                       f"of nominal {link_gbps:g} Gbit/s\n")
+
+    return (
+        f"=== {title}: {len(rounds)} rounds (warmup={warmup}) ===\n\n"
+        "Config:\n"
+        f"{cfg_block}\n\n"
+        "End-to-end (ms):\n"
+        f"  p50   {_percentile(e2e, 50):.2f}   "
+        f"p95   {_percentile(e2e, 95):.2f}   "
+        f"mean  {_mean(e2e):.2f}\n"
+        f"  Throughput        {1.0/mean_e2e_s if mean_e2e_s > 0 else 0:.2f} round/s\n\n"
+        "Phase timings (ms, mean):\n"
+        f"  GPU forward       {_mean(gpu):.2f}\n"
+        f"  Wire recv         {_mean(wire):.2f}\n"
+        f"  CPU verify        {_mean(verify):.2f}\n\n"
+        "Wire bytes (per round):\n"
+        f"  Predicted         {bytes_pred_mb:.2f} MB\n"
+        f"  Measured          {bytes_recv_mb:.2f} MB\n\n"
+        f"Wire estimate (per round, {bytes_recv_mb:.2f} MB payload):\n"
+        f"{wire_lines}\n"
+        "Verification:\n"
+        f"  rounds passed     {passed} / {len(measured)}\n"
+        f"{mse_lines}"
+    )
