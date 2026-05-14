@@ -162,3 +162,55 @@ def test_worker_load_round_trip():
     assert worker.hidden == cfg_kwargs["hidden"]
     assert worker.heads == cfg_kwargs["heads"]
     assert worker.kv_heads == cfg_kwargs["kv_heads"]
+
+
+def test_coordinator_loopback_round_passes_with_no_fault():
+    m = _load()
+    cfg = m.AttnLlamaConfig(hidden=32, heads=4, kv_heads=4, head_dim=8,
+                            batch=2, seq=8, wire_dtype=m.DTYPE_FP32,
+                            weight_seed=7)
+    port = m.pick_free_port()
+    worker = m.Worker(bind_host="127.0.0.1", bind_port=port, device="cpu",
+                      inject_fault="none", pipeline=False, quiet=True)
+    t = threading.Thread(target=worker.serve_once, daemon=True)
+    t.start()
+    m.wait_port(port, timeout=3.0)
+
+    coord = m.Coordinator(host="127.0.0.1", port=port, config=cfg,
+                          threshold=1e-3, k=m.SLALOM_K, pipeline=False)
+    try:
+        coord.connect_and_load()
+        rm = coord.run_round(request_id=1, input_seed=1234)
+    finally:
+        coord.close()
+    t.join(2.0)
+
+    assert rm.ok is True
+    assert rm.mse[m.OP_Q] < 1e-3
+    assert rm.mse[m.OP_O] < 1e-3
+    assert rm.bytes_recv == rm.bytes_recv_predicted
+
+
+def test_coordinator_loopback_detects_flip_v_fault():
+    m = _load()
+    cfg = m.AttnLlamaConfig(hidden=32, heads=4, kv_heads=4, head_dim=8,
+                            batch=2, seq=8, wire_dtype=m.DTYPE_FP32,
+                            weight_seed=7)
+    port = m.pick_free_port()
+    worker = m.Worker(bind_host="127.0.0.1", bind_port=port, device="cpu",
+                      inject_fault="flip_v", pipeline=False, quiet=True)
+    t = threading.Thread(target=worker.serve_once, daemon=True)
+    t.start()
+    m.wait_port(port, timeout=3.0)
+
+    coord = m.Coordinator(host="127.0.0.1", port=port, config=cfg,
+                          threshold=1e-3, k=m.SLALOM_K, pipeline=False)
+    try:
+        coord.connect_and_load()
+        rm = coord.run_round(request_id=1, input_seed=1234)
+    finally:
+        coord.close()
+    t.join(2.0)
+
+    assert rm.ok is False
+    assert rm.mse[m.OP_V] > 1e-2  # well above the 1e-3 threshold

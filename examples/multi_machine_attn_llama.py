@@ -413,3 +413,199 @@ class Worker:
             attn_out = (probs @ vv).transpose(1, 2).reshape(B, S, cfg.hidden)
             return q, k, v, self.o_proj(attn_out)
         raise ValueError(f"unknown inject_fault: {self.inject_fault}")
+
+
+# ── Coordinator ─────────────────────────────────────────────────────
+class Coordinator:
+    """Trusted host. Owns SLALOM state and verifies every linear output."""
+
+    def __init__(self, host: str, port: int, config: AttnLlamaConfig,
+                 threshold: float, k: int = SLALOM_K, pipeline: bool = False,
+                 o_threshold: Optional[float] = None):
+        self.host = host
+        self.port = port
+        self.config = config
+        self.threshold = threshold
+        self.o_threshold = o_threshold if o_threshold is not None else threshold
+        self.k = k
+        self.pipeline = pipeline
+        # CPU fp32 weights
+        self.q_proj, self.k_proj, self.v_proj, self.o_proj = make_attn_weights(
+            config, dtype=torch.float32, device="cpu")
+        # SLALOM keys per op
+        cfg_in_qkv = config.hidden
+        cfg_out_q  = config.heads * config.head_dim
+        cfg_out_kv = config.kv_heads * config.head_dim
+        cfg_out_o  = config.hidden
+        self.s_q  = make_s(cfg_out_q,  k, seed=S_GENERATOR_SEED + 1)
+        self.s_k  = make_s(cfg_out_kv, k, seed=S_GENERATOR_SEED + 2)
+        self.s_v  = make_s(cfg_out_kv, k, seed=S_GENERATOR_SEED + 3)
+        self.s_o  = make_s(cfg_out_o,  k, seed=S_GENERATOR_SEED + 4)
+        self.s_tilde_q = precompute_s_tilde(self.q_proj.weight, self.s_q)
+        self.s_tilde_k = precompute_s_tilde(self.k_proj.weight, self.s_k)
+        self.s_tilde_v = precompute_s_tilde(self.v_proj.weight, self.s_v)
+        self.s_tilde_o = precompute_s_tilde(self.o_proj.weight, self.s_o)
+        # Per-(seq) RoPE precompute is done lazily
+        self._rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.sock: Optional[socket.socket] = None
+        self.pool = ThreadPoolExecutor(max_workers=4)
+
+    def _get_rope_cpu(self, seq: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if seq not in self._rope_cache:
+            self._rope_cache[seq] = precompute_rope_cos_sin(
+                self.config.head_dim, seq, base=self.config.rope_base)
+        return self._rope_cache[seq]
+
+    def connect_and_load(self) -> None:
+        self.sock = socket.create_connection((self.host, self.port), timeout=30)
+        body = pack_load_req(
+            hidden=self.config.hidden, heads=self.config.heads,
+            kv_heads=self.config.kv_heads, head_dim=self.config.head_dim,
+            rope_base_e9=int(self.config.rope_base * 1000),
+            weight_seed=self.config.weight_seed,
+            dtype_id=self.config.wire_dtype,
+        )
+        send_msg(self.sock, MSG_LOAD_REQ, body)
+        mt, ack = recv_msg(self.sock)
+        if mt != MSG_LOAD_ACK:
+            raise WireProtocolError(f"expected LOAD_ACK, got {mt}")
+        if unpack_load_ack(ack)["status"] != 0:
+            raise RuntimeError("worker LOAD failed")
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                send_msg(self.sock, MSG_CLOSE, b"")
+            except OSError:
+                pass
+            self.sock.close()
+            self.sock = None
+        self.pool.shutdown(wait=False)
+
+    def reproduce_input_cpu(self, input_seed: int) -> torch.Tensor:
+        gen = torch.Generator(device="cpu").manual_seed(input_seed)
+        return torch.randn(self.config.batch, self.config.seq,
+                           self.config.hidden, dtype=torch.float32, generator=gen)
+
+    def predicted_recv_bytes(self) -> int:
+        # 4 TENSOR + 1 FORWARD_DONE
+        frame_hdr = 8
+        # tensor body header = struct.calcsize("<QHBB") + ndim*4 (3 dims)
+        tensor_body_hdr = struct.calcsize("<QHBB") + 4 * 3
+        done_body = struct.calcsize("<Qd")
+        ds = _DTYPE_SIZE[self.config.wire_dtype]
+        cfg = self.config
+        bytes_q = cfg.batch * cfg.seq * cfg.heads * cfg.head_dim * ds
+        bytes_k = cfg.batch * cfg.seq * cfg.kv_heads * cfg.head_dim * ds
+        bytes_v = bytes_k
+        bytes_o = cfg.batch * cfg.seq * cfg.hidden * ds
+        return (4 * (frame_hdr + tensor_body_hdr) + (frame_hdr + done_body)
+                + bytes_q + bytes_k + bytes_v + bytes_o)
+
+    def _expected_shape(self, op_tag: int) -> tuple:
+        cfg = self.config
+        if op_tag == OP_Q:
+            return (cfg.batch, cfg.seq, cfg.heads * cfg.head_dim)
+        if op_tag in (OP_K, OP_V):
+            return (cfg.batch, cfg.seq, cfg.kv_heads * cfg.head_dim)
+        if op_tag == OP_O:
+            return (cfg.batch, cfg.seq, cfg.hidden)
+        raise WireProtocolError(f"unknown op_tag {op_tag}")
+
+    def _recompute_attn_cpu(
+        self, q_cpu: torch.Tensor, k_cpu: torch.Tensor, v_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run attention math on CPU using fp32 q/k/v from worker."""
+        cfg = self.config
+        cos, sin = self._get_rope_cpu(cfg.seq)
+        q = q_cpu.view(cfg.batch, cfg.seq, cfg.heads,    cfg.head_dim).transpose(1, 2)
+        k = k_cpu.view(cfg.batch, cfg.seq, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
+        v = v_cpu.view(cfg.batch, cfg.seq, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
+        q, k = apply_rope_llama(q, k, cos, sin)
+        k = repeat_kv(k, cfg.num_kv_groups)
+        v = repeat_kv(v, cfg.num_kv_groups)
+        scores = q @ k.transpose(-2, -1) * (cfg.head_dim ** -0.5)
+        scores = scores + causal_mask(cfg.seq, scores.device, scores.dtype)
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32)
+        attn_out = (probs @ v).transpose(1, 2).contiguous().reshape(
+            cfg.batch, cfg.seq, cfg.hidden)
+        return attn_out
+
+    @staticmethod
+    def _timed(fn, *args):
+        t0 = time.perf_counter()
+        mse = fn(*args)
+        return mse, (time.perf_counter() - t0) * 1000.0
+
+    def run_round(self, request_id: int, input_seed: int) -> RoundMetricsBase:
+        assert self.sock is not None, "call connect_and_load() first"
+        rm = RoundMetricsBase(request_id=request_id)
+        rm.bytes_recv_predicted = self.predicted_recv_bytes()
+
+        x_cpu = self.reproduce_input_cpu(input_seed)
+
+        t_start = time.perf_counter()
+        rm.bytes_sent = send_msg(
+            self.sock, MSG_FORWARD_REQ,
+            pack_forward_req(request_id, input_seed,
+                             self.config.batch, self.config.seq))
+
+        t_wire_start = time.perf_counter()
+        bytes_recv = 0
+        acts: dict[int, torch.Tensor] = {}
+        gpu_t = 0.0
+        done = False
+        while not done or len(acts) < 4:
+            mt, body = recv_msg(self.sock)
+            bytes_recv += 8 + len(body)
+            if mt == MSG_TENSOR:
+                d = unpack_tensor(body)
+                op = d["op_tag"]
+                t = d["tensor"]
+                if tuple(t.shape) != self._expected_shape(op):
+                    raise WireProtocolError(
+                        f"op_tag={op}: expected {self._expected_shape(op)}, "
+                        f"got {tuple(t.shape)}")
+                rm.recv_tensors[op] = {
+                    "shape": list(t.shape),
+                    "dtype": _DTYPE_NAME[d["dtype_id"]],
+                    "bytes": 8 + len(body),
+                }
+                acts[op] = t.to(torch.float32)
+            elif mt == MSG_FORWARD_DONE:
+                gpu_t = unpack_forward_done(body)["gpu_forward_t_ms"]
+                done = True
+            else:
+                raise WireProtocolError(f"unexpected msg_type {mt}")
+        t_wire_end = time.perf_counter()
+        rm.bytes_recv = bytes_recv
+        rm.gpu_forward_t = gpu_t
+        rm.wire_recv_t = (t_wire_end - t_wire_start) * 1000.0
+
+        # SLALOM-verify q/k/v in parallel; recompute attn on CPU; SLALOM-verify o
+        t_v_start = time.perf_counter()
+        f_q = self.pool.submit(self._timed, slalom_verify_safe,
+                               x_cpu, acts[OP_Q], self.s_q, self.s_tilde_q)
+        f_k = self.pool.submit(self._timed, slalom_verify_safe,
+                               x_cpu, acts[OP_K], self.s_k, self.s_tilde_k)
+        f_v = self.pool.submit(self._timed, slalom_verify_safe,
+                               x_cpu, acts[OP_V], self.s_v, self.s_tilde_v)
+        rm.mse[OP_Q], rm.cpu_verify_per_op_t[OP_Q] = f_q.result()
+        rm.mse[OP_K], rm.cpu_verify_per_op_t[OP_K] = f_k.result()
+        rm.mse[OP_V], rm.cpu_verify_per_op_t[OP_V] = f_v.result()
+        attn_out_cpu = self._recompute_attn_cpu(acts[OP_Q], acts[OP_K], acts[OP_V])
+        rm.mse[OP_O], rm.cpu_verify_per_op_t[OP_O] = self._timed(
+            slalom_verify_safe, attn_out_cpu, acts[OP_O], self.s_o, self.s_tilde_o)
+        rm.cpu_verify_t = (time.perf_counter() - t_v_start) * 1000.0
+
+        rm.end_to_end_t = (time.perf_counter() - t_start) * 1000.0
+        rm.ok = (
+            rm.mse[OP_Q] <= self.threshold and
+            rm.mse[OP_K] <= self.threshold and
+            rm.mse[OP_V] <= self.threshold and
+            rm.mse[OP_O] <= self.o_threshold
+        )
+        return rm
+
+    def run_many(self, rounds: int, *, input_seed_start: int = 1_000_000) -> list:
+        return [self.run_round(i, input_seed_start + i) for i in range(rounds)]
