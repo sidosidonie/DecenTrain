@@ -43,10 +43,12 @@ from _multi_machine_common import (                                     # noqa: 
     MSG_LOAD_ACK, MSG_LOAD_REQ, MSG_TENSOR,
     RoundMetricsBase, SLALOM_K, S_GENERATOR_SEED, WireProtocolError,
     _DTYPE_NAME, _DTYPE_SIZE, _NAME_TO_DTYPE, _TORCH_DTYPE,
+    _sendmsg_all,
     apply_rope_llama, default_slalom_threshold, format_summary,
     launch_loopback_worker, cleanup_loopback_worker, make_s, pack_tensor,
     pick_free_port, precompute_rope_cos_sin, precompute_s_tilde,
-    recv_msg, send_msg, slalom_verify, slalom_verify_safe,
+    prepare_tensor_send, recv_msg, send_msg, send_tensor,
+    slalom_verify, slalom_verify_safe, tune_socket,
     unpack_tensor, wait_port,
 )
 
@@ -252,6 +254,7 @@ class Worker:
         try:
             while True:
                 sock, addr = srv.accept()
+                tune_socket(sock)  # TCP_NODELAY + larger SO_SNDBUF/SO_RCVBUF
                 self._log(f"connection from {addr[0]}:{addr[1]}")
                 try:
                     handled = self._serve_session(sock)
@@ -338,10 +341,11 @@ class Worker:
             self._send_pipelined(sock, request_id,
                                  q_raw, k_raw, v_raw, output, gpu_t_ms)
         else:
+            # Zero-copy sendmsg path: avoids the ~4 MB header+payload memcpy
+            # that pack_tensor + send_msg would do per tensor.
             for tag, t in ((OP_Q, q_raw), (OP_K, k_raw),
                            (OP_V, v_raw), (OP_O, output)):
-                send_msg(sock, MSG_TENSOR,
-                         pack_tensor(request_id, tag, t, self.wire_dtype_id))
+                send_tensor(sock, request_id, tag, t, self.wire_dtype_id)
             send_msg(sock, MSG_FORWARD_DONE,
                      pack_forward_done(request_id, gpu_t_ms))
 
@@ -355,6 +359,9 @@ class Worker:
                   f"{self.device.type}, sent {sent_mb:.2f} MB ({mode}){fault}")
 
     def _send_pipelined(self, sock, request_id, q, k, v, o, gpu_t_ms) -> None:
+        """Pipelined send: sender thread sendmsg's tensor N while main thread
+        prepares (D2H + dtype) tensor N+1. Combines with zero-copy sendmsg so
+        each tensor is shipped without any header/payload concatenation."""
         send_q: queue.Queue = queue.Queue()
         sender_exc: list = []
 
@@ -364,17 +371,23 @@ class Worker:
                     item = send_q.get()
                     if item is None:
                         return
-                    mtype, body = item
-                    send_msg(sock, mtype, body)
+                    kind, payload = item
+                    if kind == "iov":   # list of buffers ready for sendmsg
+                        _sendmsg_all(sock, payload)
+                    else:               # ("msg", (mtype, body))
+                        mtype, body = payload
+                        send_msg(sock, mtype, body)
             except Exception as e:
                 sender_exc.append(e)
 
         t = threading.Thread(target=_sender, daemon=True)
         t.start()
         for tag, ten in ((OP_Q, q), (OP_K, k), (OP_V, v), (OP_O, o)):
-            send_q.put((MSG_TENSOR,
-                        pack_tensor(request_id, tag, ten, self.wire_dtype_id)))
-        send_q.put((MSG_FORWARD_DONE, pack_forward_done(request_id, gpu_t_ms)))
+            bufs, _ = prepare_tensor_send(
+                request_id, tag, ten, self.wire_dtype_id)
+            send_q.put(("iov", bufs))
+        send_q.put(("msg", (MSG_FORWARD_DONE,
+                             pack_forward_done(request_id, gpu_t_ms))))
         send_q.put(None)
         t.join()
         if sender_exc:
@@ -458,6 +471,7 @@ class Coordinator:
 
     def connect_and_load(self) -> None:
         self.sock = socket.create_connection((self.host, self.port), timeout=30)
+        tune_socket(self.sock)  # match the worker's TCP_NODELAY + SO_*BUF
         body = pack_load_req(
             hidden=self.config.hidden, heads=self.config.heads,
             kv_heads=self.config.kv_heads, head_dim=self.config.head_dim,
@@ -550,9 +564,16 @@ class Coordinator:
             pack_forward_req(request_id, input_seed,
                              self.config.batch, self.config.seq))
 
+        # In pipeline mode, dispatch each verify the moment its tensor arrives,
+        # so q/k/v SLALOM verification overlaps with the recv of subsequent
+        # tensors and the o-recompute+verify overlaps with FORWARD_DONE recv.
+        # In sequential mode, recv all 4 tensors first, then dispatch verifies.
         t_wire_start = time.perf_counter()
         bytes_recv = 0
         acts: dict[int, torch.Tensor] = {}
+        futures: dict[int, object] = {}
+        attn_future: Optional[object] = None  # CPU attn recompute (kicked off when v arrives)
+        first_submit_t: Optional[float] = None
         gpu_t = 0.0
         done = False
         while not done or len(acts) < 4:
@@ -571,7 +592,40 @@ class Coordinator:
                     "dtype": _DTYPE_NAME[d["dtype_id"]],
                     "bytes": 8 + len(body),
                 }
-                acts[op] = t.to(torch.float32)
+                t32 = t.to(torch.float32)
+                acts[op] = t32
+                if self.pipeline:
+                    if first_submit_t is None:
+                        first_submit_t = time.perf_counter()
+                    if op == OP_Q:
+                        futures[OP_Q] = self.pool.submit(
+                            self._timed, slalom_verify_safe,
+                            x_cpu, t32, self.s_q, self.s_tilde_q)
+                    elif op == OP_K:
+                        futures[OP_K] = self.pool.submit(
+                            self._timed, slalom_verify_safe,
+                            x_cpu, t32, self.s_k, self.s_tilde_k)
+                    elif op == OP_V:
+                        futures[OP_V] = self.pool.submit(
+                            self._timed, slalom_verify_safe,
+                            x_cpu, t32, self.s_v, self.s_tilde_v)
+                        # All q/k/v fp32 are now in acts -- start CPU attn
+                        # recompute immediately so it overlaps with the recv of
+                        # o + FORWARD_DONE (the slow part of o-verify).
+                        q32, k32, v32 = acts[OP_Q], acts[OP_K], acts[OP_V]
+                        attn_future = self.pool.submit(
+                            self._recompute_attn_cpu, q32, k32, v32)
+                    elif op == OP_O:
+                        # attn-recompute is already in flight; just chain the
+                        # SLALOM verify of o on top of its result.
+                        af = attn_future
+                        def _verify_o(af=af, o32=t32):
+                            t0 = time.perf_counter()
+                            attn = af.result()
+                            mse = slalom_verify_safe(
+                                attn, o32, self.s_o, self.s_tilde_o)
+                            return mse, (time.perf_counter() - t0) * 1000.0
+                        futures[OP_O] = self.pool.submit(_verify_o)
             elif mt == MSG_FORWARD_DONE:
                 gpu_t = unpack_forward_done(body)["gpu_forward_t_ms"]
                 done = True
@@ -582,21 +636,32 @@ class Coordinator:
         rm.gpu_forward_t = gpu_t
         rm.wire_recv_t = (t_wire_end - t_wire_start) * 1000.0
 
-        # SLALOM-verify q/k/v in parallel; recompute attn on CPU; SLALOM-verify o
-        t_v_start = time.perf_counter()
-        f_q = self.pool.submit(self._timed, slalom_verify_safe,
-                               x_cpu, acts[OP_Q], self.s_q, self.s_tilde_q)
-        f_k = self.pool.submit(self._timed, slalom_verify_safe,
-                               x_cpu, acts[OP_K], self.s_k, self.s_tilde_k)
-        f_v = self.pool.submit(self._timed, slalom_verify_safe,
-                               x_cpu, acts[OP_V], self.s_v, self.s_tilde_v)
-        rm.mse[OP_Q], rm.cpu_verify_per_op_t[OP_Q] = f_q.result()
-        rm.mse[OP_K], rm.cpu_verify_per_op_t[OP_K] = f_k.result()
-        rm.mse[OP_V], rm.cpu_verify_per_op_t[OP_V] = f_v.result()
-        attn_out_cpu = self._recompute_attn_cpu(acts[OP_Q], acts[OP_K], acts[OP_V])
-        rm.mse[OP_O], rm.cpu_verify_per_op_t[OP_O] = self._timed(
-            slalom_verify_safe, attn_out_cpu, acts[OP_O], self.s_o, self.s_tilde_o)
-        rm.cpu_verify_t = (time.perf_counter() - t_v_start) * 1000.0
+        if self.pipeline:
+            # Verifies were dispatched during recv (and attn-recompute too).
+            # cpu_verify_t spans from the first submit to the last collected
+            # result -- it overlaps wire_recv_t, so wire_recv_t + cpu_verify_t
+            # > end_to_end_t in this mode.
+            rm.mse[OP_Q], rm.cpu_verify_per_op_t[OP_Q] = futures[OP_Q].result()
+            rm.mse[OP_K], rm.cpu_verify_per_op_t[OP_K] = futures[OP_K].result()
+            rm.mse[OP_V], rm.cpu_verify_per_op_t[OP_V] = futures[OP_V].result()
+            rm.mse[OP_O], rm.cpu_verify_per_op_t[OP_O] = futures[OP_O].result()
+            rm.cpu_verify_t = (time.perf_counter() - (first_submit_t or t_wire_end)) * 1000.0
+        else:
+            # Sequential: SLALOM-verify q/k/v in parallel; recompute attn; verify o.
+            t_v_start = time.perf_counter()
+            f_q = self.pool.submit(self._timed, slalom_verify_safe,
+                                   x_cpu, acts[OP_Q], self.s_q, self.s_tilde_q)
+            f_k = self.pool.submit(self._timed, slalom_verify_safe,
+                                   x_cpu, acts[OP_K], self.s_k, self.s_tilde_k)
+            f_v = self.pool.submit(self._timed, slalom_verify_safe,
+                                   x_cpu, acts[OP_V], self.s_v, self.s_tilde_v)
+            rm.mse[OP_Q], rm.cpu_verify_per_op_t[OP_Q] = f_q.result()
+            rm.mse[OP_K], rm.cpu_verify_per_op_t[OP_K] = f_k.result()
+            rm.mse[OP_V], rm.cpu_verify_per_op_t[OP_V] = f_v.result()
+            attn_out_cpu = self._recompute_attn_cpu(acts[OP_Q], acts[OP_K], acts[OP_V])
+            rm.mse[OP_O], rm.cpu_verify_per_op_t[OP_O] = self._timed(
+                slalom_verify_safe, attn_out_cpu, acts[OP_O], self.s_o, self.s_tilde_o)
+            rm.cpu_verify_t = (time.perf_counter() - t_v_start) * 1000.0
 
         rm.end_to_end_t = (time.perf_counter() - t_start) * 1000.0
         rm.ok = (
