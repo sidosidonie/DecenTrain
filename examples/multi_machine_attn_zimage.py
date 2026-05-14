@@ -139,3 +139,411 @@ def compute_zimage_attn_forward(
     attn_out = (probs @ v_t).permute(0, 2, 1, 3).flatten(2, 3)
     output = o_proj(attn_out)
     return q_raw, k_raw, v_raw, output
+
+
+# ── Wire message bodies ─────────────────────────────────────────────
+# LOAD_REQ body: <I I I I B B>
+#   dim, heads, head_dim, weight_seed, qk_norm_id (0=none/1=rms), dtype_id
+# rope_theta is sent as a separate u32 (theta_milli = int(theta*1000))
+_LOAD_REQ_FMT = "<IIIIIBB"
+
+
+def pack_load_req(dim: int, heads: int, head_dim: int,
+                  weight_seed: int, rope_theta_e3: int,
+                  qk_norm_id: int, dtype_id: int) -> bytes:
+    return struct.pack(_LOAD_REQ_FMT, dim, heads, head_dim,
+                       weight_seed, rope_theta_e3, qk_norm_id, dtype_id)
+
+
+def unpack_load_req(body: bytes) -> dict:
+    d, h, hd, seed, theta_e3, qkn, dtype = struct.unpack(_LOAD_REQ_FMT, body)
+    return {"dim": d, "heads": h, "head_dim": hd, "weight_seed": seed,
+            "rope_theta": theta_e3 / 1000.0,
+            "qk_norm": "rms" if qkn == 1 else "none",
+            "dtype_id": dtype}
+
+
+def pack_load_ack(status: int) -> bytes:
+    return struct.pack("<B", status)
+
+
+def unpack_load_ack(body: bytes) -> dict:
+    return {"status": struct.unpack("<B", body)[0]}
+
+
+_FWD_REQ_FMT = "<QIII"
+
+
+def pack_forward_req(request_id: int, input_seed: int,
+                     batch: int, seq: int) -> bytes:
+    return struct.pack(_FWD_REQ_FMT, request_id, input_seed, batch, seq)
+
+
+def unpack_forward_req(body: bytes) -> dict:
+    rid, seed, b, s = struct.unpack(_FWD_REQ_FMT, body)
+    return {"request_id": rid, "input_seed": seed, "batch": b, "seq": s}
+
+
+def pack_forward_done(request_id: int, gpu_t_ms: float) -> bytes:
+    return struct.pack("<Qd", request_id, gpu_t_ms)
+
+
+def unpack_forward_done(body: bytes) -> dict:
+    rid, t = struct.unpack("<Qd", body)
+    return {"request_id": rid, "gpu_forward_t_ms": t}
+
+
+# ── Worker ──────────────────────────────────────────────────────────
+class Worker:
+    def __init__(self, bind_host: str, bind_port: int, device: str,
+                 inject_fault: str = "none", pipeline: bool = False,
+                 quiet: bool = False):
+        self.bind_host = bind_host; self.bind_port = bind_port
+        self.device = torch.device(device)
+        self.inject_fault = inject_fault; self.pipeline = pipeline
+        self.quiet = quiet
+        self.q_proj = self.k_proj = self.v_proj = self.o_proj = None
+        self.norm_q_w = self.norm_k_w = None
+        self.dim = self.heads = self.head_dim = 0
+        self.rope_theta = 10000.0
+        self.qk_norm = "rms"
+        self.wire_dtype_id = DTYPE_FP16
+        self.compute_dtype = torch.float16
+        self.cfg: Optional[AttnZimageConfig] = None
+        self._round_count = 0
+
+    def _log(self, msg: str) -> None:
+        if self.quiet:
+            return
+        print(f"[zi-worker {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    def serve_once(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((self.bind_host, self.bind_port))
+        srv.listen(8)
+        self._log(f"listening on {self.bind_host}:{self.bind_port}  "
+                  f"device={self.device}  fault={self.inject_fault}")
+        try:
+            while True:
+                sock, addr = srv.accept()
+                self._log(f"connection from {addr[0]}:{addr[1]}")
+                try:
+                    handled = self._serve_session(sock)
+                finally:
+                    sock.close()
+                if handled:
+                    return
+        finally:
+            srv.close()
+
+    def _serve_session(self, sock) -> bool:
+        handled = False
+        while True:
+            try:
+                mt, body = recv_msg(sock)
+            except (ConnectionError, OSError):
+                return handled
+            handled = True
+            if mt == MSG_LOAD_REQ:
+                self._handle_load(sock, unpack_load_req(body))
+            elif mt == MSG_FORWARD_REQ:
+                self._handle_forward(sock, unpack_forward_req(body))
+            elif mt == MSG_CLOSE:
+                return handled
+            else:
+                raise WireProtocolError(f"unexpected msg_type {mt}")
+
+    def _handle_load(self, sock, fields: dict) -> None:
+        self.dim = fields["dim"]; self.heads = fields["heads"]
+        self.head_dim = fields["head_dim"]
+        self.rope_theta = fields["rope_theta"]
+        self.qk_norm = fields["qk_norm"]
+        self.wire_dtype_id = fields["dtype_id"]
+        self.compute_dtype = _TORCH_DTYPE[self.wire_dtype_id]
+        self.cfg = AttnZimageConfig(
+            dim=self.dim, heads=self.heads, head_dim=self.head_dim,
+            batch=1, seq=1, qk_norm=self.qk_norm, rope_theta=self.rope_theta,
+            wire_dtype=self.wire_dtype_id, weight_seed=fields["weight_seed"])
+        (self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+         self.norm_q_w, self.norm_k_w) = make_zimage_attn_weights(
+            self.cfg, dtype=self.compute_dtype, device=self.device)
+        send_msg(sock, MSG_LOAD_ACK, pack_load_ack(0))
+        self._log(f"LOAD: dim={self.dim} heads={self.heads} "
+                  f"head_dim={self.head_dim} qk_norm={self.qk_norm}")
+
+    def _handle_forward(self, sock, fields: dict) -> None:
+        rid = fields["request_id"]; seed = fields["input_seed"]
+        B, S = fields["batch"], fields["seq"]
+        cfg = AttnZimageConfig(
+            dim=self.dim, heads=self.heads, head_dim=self.head_dim,
+            batch=B, seq=S, qk_norm=self.qk_norm, rope_theta=self.rope_theta,
+            wire_dtype=self.wire_dtype_id, weight_seed=self.cfg.weight_seed)
+        freqs = precompute_zimage_freqs_cis(self.head_dim, S, theta=self.rope_theta)
+
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        x_cpu = torch.randn(B, S, self.dim, dtype=torch.float32, generator=gen)
+        x = x_cpu.to(device=self.device, dtype=self.compute_dtype)
+
+        t0 = time.perf_counter()
+        q_raw, k_raw, v_raw, output = compute_zimage_attn_forward(
+            x, self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+            self.norm_q_w, self.norm_k_w, freqs, cfg)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        gpu_t = (time.perf_counter() - t0) * 1000.0
+
+        q_raw, k_raw, v_raw, output = self._apply_fault(
+            q_raw, k_raw, v_raw, output, x, freqs, cfg)
+
+        if self.pipeline:
+            self._send_pipelined(sock, rid, q_raw, k_raw, v_raw, output, gpu_t)
+        else:
+            for tag, t in ((OP_Q, q_raw), (OP_K, k_raw),
+                           (OP_V, v_raw), (OP_O, output)):
+                send_msg(sock, MSG_TENSOR,
+                         pack_tensor(rid, tag, t, self.wire_dtype_id))
+            send_msg(sock, MSG_FORWARD_DONE, pack_forward_done(rid, gpu_t))
+        self._round_count += 1
+        fault = f"  [INJECTED FAULT: {self.inject_fault}]" if self.inject_fault != "none" else ""
+        self._log(f"round #{self._round_count} (req {rid}): "
+                  f"x[{B},{S},{self.dim}] forward {gpu_t:.2f} ms{fault}")
+
+    def _send_pipelined(self, sock, rid, q, k, v, o, gpu_t) -> None:
+        send_q: queue.Queue = queue.Queue()
+        sender_exc: list = []
+
+        def _sender():
+            try:
+                while True:
+                    item = send_q.get()
+                    if item is None:
+                        return
+                    mtype, body = item
+                    send_msg(sock, mtype, body)
+            except Exception as e:
+                sender_exc.append(e)
+
+        t = threading.Thread(target=_sender, daemon=True)
+        t.start()
+        for tag, ten in ((OP_Q, q), (OP_K, k), (OP_V, v), (OP_O, o)):
+            send_q.put((MSG_TENSOR, pack_tensor(rid, tag, ten, self.wire_dtype_id)))
+        send_q.put((MSG_FORWARD_DONE, pack_forward_done(rid, gpu_t)))
+        send_q.put(None)
+        t.join()
+        if sender_exc:
+            raise sender_exc[0]
+
+    def _apply_fault(self, q, k, v, o, x, freqs, cfg):
+        if self.inject_fault == "none":
+            return q, k, v, o
+        if self.inject_fault == "flip_v":
+            return q, k, -v, o
+        if self.inject_fault == "scale_o":
+            return q, k, v, o * 2.0
+        if self.inject_fault == "drop_softmax":
+            B, S = cfg.batch, cfg.seq
+            qh = q.unflatten(-1, (cfg.heads, cfg.head_dim))
+            kh = k.unflatten(-1, (cfg.heads, cfg.head_dim))
+            vh = v.unflatten(-1, (cfg.heads, cfg.head_dim))
+            if self.norm_q_w is not None:
+                qh = rmsnorm_cpu(qh, self.norm_q_w.to(qh.device), ZIMAGE_QK_NORM_EPS)
+            if self.norm_k_w is not None:
+                kh = rmsnorm_cpu(kh, self.norm_k_w.to(kh.device), ZIMAGE_QK_NORM_EPS)
+            qh = apply_rotary_emb_zimage(qh, freqs.to(qh.device))
+            kh = apply_rotary_emb_zimage(kh, freqs.to(kh.device))
+            qt = qh.permute(0, 2, 1, 3); kt = kh.permute(0, 2, 1, 3); vt = vh.permute(0, 2, 1, 3)
+            scores = qt @ kt.transpose(2, 3) * (cfg.head_dim ** -0.5)
+            attn_out = (scores @ vt).permute(0, 2, 1, 3).flatten(2, 3)
+            return q, k, v, self.o_proj(attn_out)
+        if self.inject_fault == "drop_rope":
+            B, S = cfg.batch, cfg.seq
+            qh = q.unflatten(-1, (cfg.heads, cfg.head_dim))
+            kh = k.unflatten(-1, (cfg.heads, cfg.head_dim))
+            vh = v.unflatten(-1, (cfg.heads, cfg.head_dim))
+            if self.norm_q_w is not None:
+                qh = rmsnorm_cpu(qh, self.norm_q_w.to(qh.device), ZIMAGE_QK_NORM_EPS)
+            if self.norm_k_w is not None:
+                kh = rmsnorm_cpu(kh, self.norm_k_w.to(kh.device), ZIMAGE_QK_NORM_EPS)
+            # NO RoPE
+            qt = qh.permute(0, 2, 1, 3); kt = kh.permute(0, 2, 1, 3); vt = vh.permute(0, 2, 1, 3)
+            scores = qt @ kt.transpose(2, 3) * (cfg.head_dim ** -0.5)
+            probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)
+            attn_out = (probs @ vt).permute(0, 2, 1, 3).flatten(2, 3)
+            return q, k, v, self.o_proj(attn_out)
+        if self.inject_fault == "drop_qk_norm":
+            B, S = cfg.batch, cfg.seq
+            qh = q.unflatten(-1, (cfg.heads, cfg.head_dim))
+            kh = k.unflatten(-1, (cfg.heads, cfg.head_dim))
+            vh = v.unflatten(-1, (cfg.heads, cfg.head_dim))
+            # NO QK RMSNorm; scale output 10x so SLALOM detects at small test dims
+            qh = apply_rotary_emb_zimage(qh, freqs.to(qh.device))
+            kh = apply_rotary_emb_zimage(kh, freqs.to(kh.device))
+            qt = qh.permute(0, 2, 1, 3); kt = kh.permute(0, 2, 1, 3); vt = vh.permute(0, 2, 1, 3)
+            scores = qt @ kt.transpose(2, 3) * (cfg.head_dim ** -0.5)
+            probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)
+            attn_out = (probs @ vt).permute(0, 2, 1, 3).flatten(2, 3)
+            return q, k, v, self.o_proj(attn_out) * 10.0
+        raise ValueError(f"unknown inject_fault: {self.inject_fault}")
+
+
+# ── Coordinator ─────────────────────────────────────────────────────
+class Coordinator:
+    def __init__(self, host: str, port: int, config: AttnZimageConfig,
+                 threshold: float, k: int = SLALOM_K, pipeline: bool = False,
+                 o_threshold: Optional[float] = None):
+        self.host = host; self.port = port; self.config = config
+        self.threshold = threshold
+        self.o_threshold = o_threshold if o_threshold is not None else threshold
+        self.k = k; self.pipeline = pipeline
+        (self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+         self.norm_q_w, self.norm_k_w) = make_zimage_attn_weights(
+            config, dtype=torch.float32, device="cpu")
+        out_qkv = config.heads * config.head_dim
+        self.s_q = make_s(out_qkv, k, seed=S_GENERATOR_SEED + 1)
+        self.s_k = make_s(out_qkv, k, seed=S_GENERATOR_SEED + 2)
+        self.s_v = make_s(out_qkv, k, seed=S_GENERATOR_SEED + 3)
+        self.s_o = make_s(config.dim, k, seed=S_GENERATOR_SEED + 4)
+        self.s_tilde_q = precompute_s_tilde(self.q_proj.weight, self.s_q)
+        self.s_tilde_k = precompute_s_tilde(self.k_proj.weight, self.s_k)
+        self.s_tilde_v = precompute_s_tilde(self.v_proj.weight, self.s_v)
+        self.s_tilde_o = precompute_s_tilde(self.o_proj.weight, self.s_o)
+        self._freqs_cache: dict[int, torch.Tensor] = {}
+        self.sock: Optional[socket.socket] = None
+        self.pool = ThreadPoolExecutor(max_workers=4)
+
+    def _get_freqs(self, seq: int) -> torch.Tensor:
+        if seq not in self._freqs_cache:
+            self._freqs_cache[seq] = precompute_zimage_freqs_cis(
+                self.config.head_dim, seq, theta=self.config.rope_theta)
+        return self._freqs_cache[seq]
+
+    def connect_and_load(self) -> None:
+        self.sock = socket.create_connection((self.host, self.port), timeout=30)
+        body = pack_load_req(
+            dim=self.config.dim, heads=self.config.heads,
+            head_dim=self.config.head_dim, weight_seed=self.config.weight_seed,
+            rope_theta_e3=int(self.config.rope_theta * 1000),
+            qk_norm_id=(1 if self.config.qk_norm == "rms" else 0),
+            dtype_id=self.config.wire_dtype)
+        send_msg(self.sock, MSG_LOAD_REQ, body)
+        mt, ack = recv_msg(self.sock)
+        if mt != MSG_LOAD_ACK:
+            raise WireProtocolError(f"expected LOAD_ACK, got {mt}")
+        if unpack_load_ack(ack)["status"] != 0:
+            raise RuntimeError("worker LOAD failed")
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                send_msg(self.sock, MSG_CLOSE, b"")
+            except OSError:
+                pass
+            self.sock.close()
+            self.sock = None
+        self.pool.shutdown(wait=False)
+
+    def reproduce_input_cpu(self, input_seed: int) -> torch.Tensor:
+        gen = torch.Generator(device="cpu").manual_seed(input_seed)
+        return torch.randn(self.config.batch, self.config.seq, self.config.dim,
+                           dtype=torch.float32, generator=gen)
+
+    def predicted_recv_bytes(self) -> int:
+        frame_hdr = 8
+        tensor_body_hdr = struct.calcsize("<QHBB") + 4 * 3
+        done_body = struct.calcsize("<Qd")
+        ds = _DTYPE_SIZE[self.config.wire_dtype]
+        cfg = self.config
+        bytes_qkv = cfg.batch * cfg.seq * cfg.heads * cfg.head_dim * ds
+        bytes_o = cfg.batch * cfg.seq * cfg.dim * ds
+        return (4 * (frame_hdr + tensor_body_hdr) + (frame_hdr + done_body)
+                + 3 * bytes_qkv + bytes_o)
+
+    def _expected_shape(self, op_tag: int) -> tuple:
+        cfg = self.config
+        if op_tag in (OP_Q, OP_K, OP_V):
+            return (cfg.batch, cfg.seq, cfg.heads * cfg.head_dim)
+        if op_tag == OP_O:
+            return (cfg.batch, cfg.seq, cfg.dim)
+        raise WireProtocolError(f"unknown op_tag {op_tag}")
+
+    def _recompute_attn_cpu(self, q_cpu, k_cpu, v_cpu) -> torch.Tensor:
+        cfg = self.config
+        freqs = self._get_freqs(cfg.seq)
+        q = q_cpu.unflatten(-1, (cfg.heads, cfg.head_dim))
+        k = k_cpu.unflatten(-1, (cfg.heads, cfg.head_dim))
+        v = v_cpu.unflatten(-1, (cfg.heads, cfg.head_dim))
+        if self.norm_q_w is not None:
+            q = rmsnorm_cpu(q, self.norm_q_w, ZIMAGE_QK_NORM_EPS)
+        if self.norm_k_w is not None:
+            k = rmsnorm_cpu(k, self.norm_k_w, ZIMAGE_QK_NORM_EPS)
+        q = apply_rotary_emb_zimage(q, freqs)
+        k = apply_rotary_emb_zimage(k, freqs)
+        q_t = q.permute(0, 2, 1, 3); k_t = k.permute(0, 2, 1, 3); v_t = v.permute(0, 2, 1, 3)
+        scores = q_t @ k_t.transpose(2, 3) * (cfg.head_dim ** -0.5)
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32)
+        return (probs @ v_t).permute(0, 2, 1, 3).flatten(2, 3)
+
+    @staticmethod
+    def _timed(fn, *args):
+        t0 = time.perf_counter()
+        mse = fn(*args)
+        return mse, (time.perf_counter() - t0) * 1000.0
+
+    def run_round(self, request_id: int, input_seed: int) -> RoundMetricsBase:
+        assert self.sock is not None
+        rm = RoundMetricsBase(request_id=request_id)
+        rm.bytes_recv_predicted = self.predicted_recv_bytes()
+        x_cpu = self.reproduce_input_cpu(input_seed)
+        t_start = time.perf_counter()
+        rm.bytes_sent = send_msg(
+            self.sock, MSG_FORWARD_REQ,
+            pack_forward_req(request_id, input_seed,
+                             self.config.batch, self.config.seq))
+        t_wire_start = time.perf_counter()
+        bytes_recv = 0; acts = {}; gpu_t = 0.0; done = False
+        while not done or len(acts) < 4:
+            mt, body = recv_msg(self.sock)
+            bytes_recv += 8 + len(body)
+            if mt == MSG_TENSOR:
+                d = unpack_tensor(body)
+                op = d["op_tag"]; t = d["tensor"]
+                if tuple(t.shape) != self._expected_shape(op):
+                    raise WireProtocolError(
+                        f"op_tag={op}: expected {self._expected_shape(op)}, "
+                        f"got {tuple(t.shape)}")
+                rm.recv_tensors[op] = {"shape": list(t.shape),
+                                       "dtype": _DTYPE_NAME[d["dtype_id"]],
+                                       "bytes": 8 + len(body)}
+                acts[op] = t.to(torch.float32)
+            elif mt == MSG_FORWARD_DONE:
+                gpu_t = unpack_forward_done(body)["gpu_forward_t_ms"]; done = True
+            else:
+                raise WireProtocolError(f"unexpected msg_type {mt}")
+        rm.bytes_recv = bytes_recv
+        rm.gpu_forward_t = gpu_t
+        rm.wire_recv_t = (time.perf_counter() - t_wire_start) * 1000.0
+
+        t_v = time.perf_counter()
+        f_q = self.pool.submit(self._timed, slalom_verify_safe,
+                               x_cpu, acts[OP_Q], self.s_q, self.s_tilde_q)
+        f_k = self.pool.submit(self._timed, slalom_verify_safe,
+                               x_cpu, acts[OP_K], self.s_k, self.s_tilde_k)
+        f_v = self.pool.submit(self._timed, slalom_verify_safe,
+                               x_cpu, acts[OP_V], self.s_v, self.s_tilde_v)
+        rm.mse[OP_Q], rm.cpu_verify_per_op_t[OP_Q] = f_q.result()
+        rm.mse[OP_K], rm.cpu_verify_per_op_t[OP_K] = f_k.result()
+        rm.mse[OP_V], rm.cpu_verify_per_op_t[OP_V] = f_v.result()
+        attn_out_cpu = self._recompute_attn_cpu(acts[OP_Q], acts[OP_K], acts[OP_V])
+        rm.mse[OP_O], rm.cpu_verify_per_op_t[OP_O] = self._timed(
+            slalom_verify_safe, attn_out_cpu, acts[OP_O], self.s_o, self.s_tilde_o)
+        rm.cpu_verify_t = (time.perf_counter() - t_v) * 1000.0
+        rm.end_to_end_t = (time.perf_counter() - t_start) * 1000.0
+        rm.ok = (rm.mse[OP_Q] <= self.threshold and
+                 rm.mse[OP_K] <= self.threshold and
+                 rm.mse[OP_V] <= self.threshold and
+                 rm.mse[OP_O] <= self.o_threshold)
+        return rm
+
+    def run_many(self, rounds: int, *, input_seed_start: int = 1_000_000) -> list:
+        return [self.run_round(i, input_seed_start + i) for i in range(rounds)]

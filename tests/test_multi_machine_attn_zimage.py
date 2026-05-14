@@ -6,6 +6,8 @@ import pathlib
 import sys
 import threading
 
+import socket
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -89,3 +91,53 @@ def test_compute_zimage_attn_forward_matches_reference():
 
     assert torch.allclose(q_raw, q_proj(x), atol=1e-5)
     assert torch.allclose(o_raw, o_ref, atol=1e-4)
+
+
+def test_loopback_round_passes_with_no_fault():
+    m = _load()
+    cfg = m.AttnZimageConfig(dim=32, heads=4, head_dim=8, batch=2, seq=8,
+                             qk_norm="rms", wire_dtype=m.DTYPE_FP32,
+                             weight_seed=11)
+    port = m.pick_free_port()
+    worker = m.Worker(bind_host="127.0.0.1", bind_port=port, device="cpu",
+                      inject_fault="none", pipeline=False, quiet=True)
+    t = threading.Thread(target=worker.serve_once, daemon=True)
+    t.start()
+    m.wait_port(port, timeout=3.0)
+
+    coord = m.Coordinator(host="127.0.0.1", port=port, config=cfg,
+                          threshold=1e-3, k=m.SLALOM_K, pipeline=False)
+    try:
+        coord.connect_and_load()
+        rm = coord.run_round(request_id=1, input_seed=1234)
+    finally:
+        coord.close()
+    t.join(2.0)
+
+    assert rm.ok is True
+    assert rm.bytes_recv == rm.bytes_recv_predicted
+
+
+def test_loopback_round_detects_drop_qk_norm_fault():
+    m = _load()
+    cfg = m.AttnZimageConfig(dim=32, heads=4, head_dim=8, batch=2, seq=8,
+                             qk_norm="rms", wire_dtype=m.DTYPE_FP32,
+                             weight_seed=11)
+    port = m.pick_free_port()
+    worker = m.Worker(bind_host="127.0.0.1", bind_port=port, device="cpu",
+                      inject_fault="drop_qk_norm", pipeline=False, quiet=True)
+    t = threading.Thread(target=worker.serve_once, daemon=True)
+    t.start()
+    m.wait_port(port, timeout=3.0)
+
+    coord = m.Coordinator(host="127.0.0.1", port=port, config=cfg,
+                          threshold=1e-3, k=m.SLALOM_K, pipeline=False)
+    try:
+        coord.connect_and_load()
+        rm = coord.run_round(request_id=1, input_seed=1234)
+    finally:
+        coord.close()
+    t.join(2.0)
+
+    assert rm.ok is False
+    assert rm.mse[m.OP_O] > 1e-2
