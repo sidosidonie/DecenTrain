@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import socket
+import struct
 import sys
+import threading
 
 import pytest
 import torch
@@ -120,3 +123,42 @@ def test_worker_forward_matches_reference_compute():
     assert torch.allclose(k_raw, k_proj(x), atol=1e-5)
     assert torch.allclose(v_raw, v_proj(x), atol=1e-5)
     assert torch.allclose(o_raw, o_ref, atol=1e-4)
+
+
+def _start_worker_thread(worker):
+    t = threading.Thread(target=worker.serve_once, daemon=True)
+    t.start()
+    return t
+
+
+def test_worker_load_round_trip():
+    """Coordinator-side: send LOAD_REQ, receive LOAD_ACK."""
+    m = _load()
+    port = m.pick_free_port()
+    cfg_kwargs = dict(hidden=32, heads=4, kv_heads=4, head_dim=8,
+                      batch=2, seq=6, weight_seed=99)
+    worker = m.Worker(bind_host="127.0.0.1", bind_port=port,
+                      device="cpu", inject_fault="none",
+                      pipeline=False, quiet=True)
+    t = _start_worker_thread(worker)
+    m.wait_port(port, timeout=3.0)
+
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    body = m.pack_load_req(
+        hidden=cfg_kwargs["hidden"], heads=cfg_kwargs["heads"],
+        kv_heads=cfg_kwargs["kv_heads"], head_dim=cfg_kwargs["head_dim"],
+        rope_base_e9=int(500000.0 * 1e3),  # encoded as int (kHz form)
+        weight_seed=cfg_kwargs["weight_seed"],
+        dtype_id=m.DTYPE_FP32,
+    )
+    m.send_msg(sock, m.MSG_LOAD_REQ, body)
+    mt, ack = m.recv_msg(sock)
+    assert mt == m.MSG_LOAD_ACK
+    assert m.unpack_load_ack(ack)["status"] == 0
+
+    m.send_msg(sock, m.MSG_CLOSE, b"")
+    sock.close()
+    t.join(2.0)
+    assert worker.hidden == cfg_kwargs["hidden"]
+    assert worker.heads == cfg_kwargs["heads"]
+    assert worker.kv_heads == cfg_kwargs["kv_heads"]
