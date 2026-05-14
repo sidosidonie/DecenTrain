@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 
 import pytest
@@ -222,3 +224,53 @@ def test_zimage_loopback_subprocess_block_propagation():
                    if "mse[" in line and "p95" in line
                    and float(line.rsplit()[-1]) > 1e-14)
     assert high_mse >= 2, f"expected ≥2 high-mse ops, got {high_mse}\n{out.stdout}"
+
+
+# ---------------------------------------------------------------------------
+# E1: Determinism + fault-margin invariants
+# ---------------------------------------------------------------------------
+
+def _run_with_json(args: list) -> dict:
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        path = f.name
+    out = subprocess.run(
+        [sys.executable, str(EXAMPLE_PATH)] + args + ["--json-report", path],
+        capture_output=True, timeout=120, text=True,
+    )
+    assert out.returncode == 0, f"stderr:\n{out.stderr}"
+    with open(path) as f:
+        return json.load(f)
+
+
+BASE_ARGS_MINIZIMAGE = [
+    "--role", "loopback", "--device", "cpu",
+    "--dim", "16", "--heads", "2", "--head-dim", "8",
+    "--ffn-inter", "32", "--n-layers", "2",
+    "--batch", "1", "--seq", "4",
+    "--wire-dtype", "fp32", "--rounds", "2", "--warmup", "0",
+]
+
+
+def test_minizimage_determinism_two_runs_identical_mse():
+    a = _run_with_json(BASE_ARGS_MINIZIMAGE + ["--weight-seed", "0x1234"])
+    b = _run_with_json(BASE_ARGS_MINIZIMAGE + ["--weight-seed", "0x1234"])
+    a_mse = [(r["request_id"], r["mse"]) for r in a["per_round"]]
+    b_mse = [(r["request_id"], r["mse"]) for r in b["per_round"]]
+    assert a_mse == b_mse
+
+
+@pytest.mark.parametrize("fault,floor", [
+    ("flip_v", 1e-12),
+    ("scale_o", 1e-12),
+    # scale_w2 and drop_silu produce ~4e-13 at dim=16; still far above fp32 noise (~1e-15)
+    ("scale_w2", 1e-14),
+    ("flip_w1", 1e-12),
+    ("drop_silu", 1e-14),
+])
+def test_minizimage_fault_margin_above_floor(fault, floor):
+    # Mini-zimage's weights are extra-small at dim=16 → MSE values are very tiny.
+    # Floors chosen to be far above the no-fault numerical noise floor (~1e-15).
+    rep = _run_with_json(BASE_ARGS_MINIZIMAGE
+                         + ["--inject-fault", fault, "--threshold", "1e-14"])
+    max_mse = max(max(float(v) for v in r["mse"].values()) for r in rep["per_round"])
+    assert max_mse > floor, f"fault {fault}: max mse {max_mse:.2e} not > {floor:.0e}"

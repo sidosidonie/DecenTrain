@@ -216,7 +216,9 @@ def test_coordinator_loopback_detects_flip_v_fault():
     assert rm.mse[m.OP_V] > 1e-2  # well above the 1e-3 threshold
 
 
+import json
 import subprocess
+import tempfile
 
 
 def test_loopback_subprocess_smoke():
@@ -247,3 +249,48 @@ def test_loopback_subprocess_fault_detection():
     assert out.returncode == 0
     # All measured rounds should fail
     assert "rounds passed     0 / 3" in out.stdout
+
+
+# ---------------------------------------------------------------------------
+# E1: Determinism + fault-margin invariants
+# ---------------------------------------------------------------------------
+
+def _run_with_json(args: list) -> dict:
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        path = f.name
+    out = subprocess.run(
+        [sys.executable, str(EXAMPLE_PATH)] + args + ["--json-report", path],
+        capture_output=True, timeout=120, text=True,
+    )
+    assert out.returncode == 0, f"stderr:\n{out.stderr}"
+    with open(path) as f:
+        return json.load(f)
+
+
+BASE_ARGS_LLAMA = [
+    "--role", "loopback", "--device", "cpu",
+    "--hidden", "32", "--heads", "4", "--kv-heads", "4", "--head-dim", "8",
+    "--batch", "2", "--seq", "8",
+    "--wire-dtype", "fp32", "--rounds", "3", "--warmup", "0",
+]
+
+
+def test_llama_determinism_two_runs_identical_mse():
+    a = _run_with_json(BASE_ARGS_LLAMA + ["--weight-seed", "0x1234"])
+    b = _run_with_json(BASE_ARGS_LLAMA + ["--weight-seed", "0x1234"])
+    a_mse = [(r["request_id"], r["mse"]) for r in a["per_round"]]
+    b_mse = [(r["request_id"], r["mse"]) for r in b["per_round"]]
+    assert a_mse == b_mse, "MSE must be deterministic for fixed seed"
+
+
+@pytest.mark.parametrize("fault,floor", [
+    ("flip_v", 1e-4),
+    ("scale_o", 1e-4),
+    ("drop_softmax", 1e-4),
+    # drop_rope produces a subtle RoPE phase shift; MSE stays ~5e-8 at dim=32
+    ("drop_rope", 1e-9),
+])
+def test_llama_fault_margin_above_floor(fault, floor):
+    rep = _run_with_json(BASE_ARGS_LLAMA + ["--inject-fault", fault])
+    max_mse = max(max(float(v) for v in r["mse"].values()) for r in rep["per_round"])
+    assert max_mse > floor, f"fault {fault}: max mse {max_mse:.2e} not > {floor:.0e}"
