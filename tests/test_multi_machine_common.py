@@ -285,3 +285,36 @@ def test_format_summary_basic_smoke():
     assert "rounds passed" in s
     assert "foo: bar" in s
     assert "q" in s and "o" in s
+
+
+def test_pick_free_port_returns_usable_port():
+    m = _load_common()
+    p = m.pick_free_port()
+    assert 1024 <= p <= 65535
+    # Should be re-bindable (port closed before returning)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", p))
+    s.close()
+
+
+def test_wait_port_succeeds_when_open():
+    m = _load_common()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        m.wait_port(port, timeout=2.0)  # should not raise
+    finally:
+        srv.close()
+
+
+def test_wait_port_times_out_when_closed():
+    m = _load_common()
+    # Find a free port and don't bind it
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    with pytest.raises(TimeoutError):
+        m.wait_port(port, timeout=0.5)

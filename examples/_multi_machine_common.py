@@ -344,3 +344,69 @@ def format_summary(
         f"  rounds passed     {passed} / {len(measured)}\n"
         f"{mse_lines}"
     )
+
+
+# ── Loopback launcher helpers ───────────────────────────────────────
+import time
+
+
+def pick_free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def wait_port(port: int, host: str = "127.0.0.1", timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.05)
+    raise TimeoutError(f"worker port {port} did not open within {timeout}s")
+
+
+def launch_loopback_worker(
+    this_file: str, extra_worker_argv: list[str], *, device: str,
+) -> tuple:
+    """Spawn `python this_file --role worker --bind 127.0.0.1:<port> ...`
+
+    Returns (subprocess.Popen, port). Caller is responsible for terminating
+    the subprocess after the coordinator is done.
+    """
+    import subprocess
+    import sys
+    port = pick_free_port()
+    cmd = [
+        sys.executable, this_file,
+        "--role", "worker",
+        "--bind", f"127.0.0.1:{port}",
+        "--device", device,
+        *extra_worker_argv,
+    ]
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    return proc, port
+
+
+def cleanup_loopback_worker(proc, *, grace_s: float = 1.0) -> None:
+    """Wait briefly for clean exit, then SIGTERM/SIGKILL. Surface unexpected
+    non-zero exits (other than -SIGTERM, which we issued ourselves)."""
+    import subprocess
+    import sys
+    try:
+        proc.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    rc = proc.returncode
+    if rc is not None and rc != 0 and rc != -15:
+        err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+        sys.stderr.write(f"worker exited with {rc}\n{err}\n")
