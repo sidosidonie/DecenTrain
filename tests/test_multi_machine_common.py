@@ -118,3 +118,51 @@ def test_pack_tensor_uses_uint16_op_tag():
     # Header layout: <Q H B B  shape...>  → request_id(8) + op_tag(2) + dtype(1) + ndim(1) = 12 bytes
     op_tag = struct.unpack_from("<H", body, 8)[0]
     assert op_tag == 65535
+
+
+def test_make_s_deterministic():
+    m = _load_common()
+    s1 = m.make_s(out_dim=16, k=10, seed=7)
+    s2 = m.make_s(out_dim=16, k=10, seed=7)
+    s3 = m.make_s(out_dim=16, k=10, seed=8)
+    assert torch.equal(s1, s2)
+    assert s1.shape == (16, 10)
+    assert s1.dtype == torch.float32
+    assert not torch.equal(s1, s3)
+
+
+def test_slalom_verify_passes_for_correct_matmul():
+    m = _load_common()
+    torch.manual_seed(0)
+    W = torch.randn(16, 8)
+    x = torch.randn(2, 4, 8)
+    y = x @ W.t()
+    s = m.make_s(out_dim=16, k=10, seed=7)
+    s_tilde = m.precompute_s_tilde(W, s)
+    assert s_tilde.shape == (8, 10)
+    mse = m.slalom_verify(x, y, s, s_tilde)
+    assert mse < 1e-10
+
+
+def test_slalom_verify_safe_returns_inf_on_nan():
+    m = _load_common()
+    torch.manual_seed(0)
+    W = torch.randn(16, 8)
+    x = torch.randn(2, 4, 8)
+    y = x @ W.t()
+    y[0, 0, 0] = float("nan")
+    s = m.make_s(out_dim=16, k=10, seed=7)
+    s_tilde = m.precompute_s_tilde(W, s)
+    assert m.slalom_verify_safe(x, y, s, s_tilde) == float("inf")
+
+
+def test_slalom_verify_fails_for_forged_y():
+    m = _load_common()
+    torch.manual_seed(0)
+    W = torch.randn(16, 8)
+    x = torch.randn(2, 4, 8)
+    y_forged = torch.randn(2, 4, 16)  # not x @ W.T
+    s = m.make_s(out_dim=16, k=10, seed=7)
+    s_tilde = m.precompute_s_tilde(W, s)
+    mse = m.slalom_verify(x, y_forged, s, s_tilde)
+    assert mse > 1.0

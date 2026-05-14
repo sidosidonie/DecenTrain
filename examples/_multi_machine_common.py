@@ -72,6 +72,8 @@ def recv_msg(sock: socket.socket) -> tuple[int, bytes]:
 # ── Generic tensor packer ───────────────────────────────────────────
 # Header layout: <Q H B B  shape[ndim] (I*ndim)>  + payload
 #   request_id (u64) + op_tag (u16) + dtype_id (u8) + ndim (u8)
+# u16 op_tag (not u8): mini-zimage encodes (block_idx<<4 | op_kind),
+# supporting up to 4096 blocks × 16 op kinds.
 _TENSOR_HDR_FMT = "<QHBB"
 _TENSOR_HDR_SIZE = struct.calcsize(_TENSOR_HDR_FMT)
 
@@ -102,3 +104,40 @@ def unpack_tensor(body: bytes) -> dict:
     tensor = torch.from_numpy(arr.copy()).to(torch_dtype)
     return {"request_id": request_id, "op_tag": op_tag,
             "dtype_id": dtype_id, "tensor": tensor}
+
+
+# ── SLALOM ──────────────────────────────────────────────────────────
+SLALOM_K = 10
+S_GENERATOR_SEED = 0xDEADBEEF
+
+
+def make_s(out_dim: int, k: int, seed: int) -> torch.Tensor:
+    """Random projection vector. Shape (out_dim, k), fp32 on CPU."""
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    return torch.randn(out_dim, k, dtype=torch.float32, generator=gen)
+
+
+def precompute_s_tilde(weight: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """For nn.Linear y = x @ weight.T, compute s_tilde = weight.T @ s.
+
+    weight shape: (out, in).  s shape: (out, k).  Returns (in, k) fp32.
+    """
+    w = weight.detach().to(torch.float32).t().contiguous()
+    return w @ s.to(torch.float32)
+
+
+def slalom_verify(
+    x: torch.Tensor, y: torch.Tensor,
+    s: torch.Tensor, s_tilde: torch.Tensor,
+) -> float:
+    """Mean-squared-error between y@s and x@s_tilde."""
+    lhs = y.to(torch.float32) @ s
+    rhs = x.to(torch.float32) @ s_tilde
+    return ((lhs - rhs) ** 2).mean().item()
+
+
+def slalom_verify_safe(x, y, s, s_tilde) -> float:
+    """Like slalom_verify but returns inf if y has any NaN/Inf."""
+    if not torch.isfinite(y).all():
+        return float("inf")
+    return slalom_verify(x, y, s, s_tilde)
