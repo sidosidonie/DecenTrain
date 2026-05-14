@@ -80,20 +80,17 @@ def _sendmsg_all(sock: socket.socket, buffers) -> None:
             bufs[0] = bufs[0][sent:]
 
 
-# Conservative bumps; kernel will clamp to net.core.[rw]mem_max if smaller.
-_DEFAULT_SOCK_BUF = 4 * 1024 * 1024
+def tune_socket(sock: socket.socket) -> None:
+    """TCP_NODELAY only. Both peers should call it.
 
-
-def tune_socket(sock: socket.socket, sndbuf: int = _DEFAULT_SOCK_BUF,
-                rcvbuf: int = _DEFAULT_SOCK_BUF) -> None:
-    """TCP_NODELAY + larger SO_SNDBUF/SO_RCVBUF. Both peers should call it."""
+    Intentionally does NOT set SO_SNDBUF/SO_RCVBUF: doing so disables
+    Linux TCP autotuning, which grows the window up to net.ipv4.tcp_*mem[2]
+    (typically 4-32 MB). An explicit setsockopt is also clamped by
+    net.core.[rw]mem_max, which on stock kernels is ~208 KB -- much
+    smaller than what autotune would reach on its own.
+    """
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except OSError:
-        pass
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
     except OSError:
         pass
 
