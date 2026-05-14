@@ -141,3 +141,33 @@ def test_loopback_round_detects_drop_qk_norm_fault():
 
     assert rm.ok is False
     assert rm.mse[m.OP_O] > 1e-2
+
+
+import subprocess
+
+
+def test_loopback_subprocess_smoke():
+    out = subprocess.run(
+        [sys.executable, str(EXAMPLE_PATH),
+         "--role", "loopback", "--device", "cpu",
+         "--dim", "32", "--heads", "4", "--head-dim", "8",
+         "--batch", "2", "--seq", "8",
+         "--wire-dtype", "fp32", "--rounds", "5", "--warmup", "1"],
+        capture_output=True, timeout=60, text=True,
+    )
+    assert out.returncode == 0, f"stderr:\n{out.stderr}"
+    assert "rounds passed     4 / 4" in out.stdout
+
+
+def test_loopback_subprocess_drop_qk_norm_fault():
+    out = subprocess.run(
+        [sys.executable, str(EXAMPLE_PATH),
+         "--role", "loopback", "--device", "cpu",
+         "--dim", "32", "--heads", "4", "--head-dim", "8",
+         "--batch", "2", "--seq", "8",
+         "--wire-dtype", "fp32", "--rounds", "3", "--warmup", "0",
+         "--inject-fault", "drop_qk_norm"],
+        capture_output=True, timeout=60, text=True,
+    )
+    assert out.returncode == 0
+    assert "rounds passed     0 / 3" in out.stdout

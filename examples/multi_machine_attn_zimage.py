@@ -547,3 +547,102 @@ class Coordinator:
 
     def run_many(self, rounds: int, *, input_seed_start: int = 1_000_000) -> list:
         return [self.run_round(i, input_seed_start + i) for i in range(rounds)]
+
+
+# ── CLI driver ──────────────────────────────────────────────────────
+def run_coordinator(host: str, port: int, args) -> int:
+    cfg = AttnZimageConfig(
+        dim=args.dim, heads=args.heads, head_dim=args.head_dim,
+        batch=args.batch, seq=args.seq, qk_norm=args.qk_norm,
+        rope_theta=args.rope_theta, wire_dtype=_NAME_TO_DTYPE[args.wire_dtype],
+        weight_seed=args.weight_seed)
+    threshold = args.threshold
+    if threshold is None:
+        threshold = default_slalom_threshold(cfg.wire_dtype, cfg.dim)
+    o_threshold = default_slalom_threshold(cfg.wire_dtype, cfg.dim, fp16_slope=4e-6)
+    coord = Coordinator(host=host, port=port, config=cfg,
+                        threshold=threshold, k=SLALOM_K,
+                        pipeline=args.pipeline, o_threshold=o_threshold)
+    try:
+        coord.connect_and_load()
+        rounds = coord.run_many(rounds=args.rounds)
+    finally:
+        coord.close()
+    config_lines = [
+        f"Attn:     Z-Image  dim={cfg.dim}  heads={cfg.heads}  "
+        f"head_dim={cfg.head_dim}  qk_norm={cfg.qk_norm}",
+        f"Shape:    batch={cfg.batch}  seq={cfg.seq}  "
+        f"dtype={_DTYPE_NAME[cfg.wire_dtype]}",
+        f"RoPE:     theta={cfg.rope_theta} (complex-cis)",
+        f"Verify:   SLALOM  k={SLALOM_K}  thr_qkv={threshold:.1e}  "
+        f"thr_o={o_threshold:.1e}",
+        f"Pipeline: {'on' if args.pipeline else 'off'}",
+    ]
+    print(format_summary(
+        rounds, warmup=args.warmup, pipelined=args.pipeline,
+        op_names=_OP_NAME, config_lines=config_lines,
+        link_gbps=args.link_gbps,
+        title="Multi-Machine Z-Image Attention Example"))
+    if args.json_report:
+        pathlib.Path(args.json_report).write_text(json.dumps({
+            "config": asdict(cfg),
+            "per_round": [asdict(r) for r in rounds],
+        }, indent=2, default=lambda o: list(o) if isinstance(o, dict) else str(o)))
+    return 0
+
+
+def launch_loopback(args) -> int:
+    proc, port = launch_loopback_worker(
+        __file__, extra_worker_argv=["--inject-fault", args.inject_fault]
+                  + (["--pipeline"] if args.pipeline else []),
+        device=args.device)
+    try:
+        wait_port(port, timeout=10.0)
+        return run_coordinator("127.0.0.1", port, args)
+    finally:
+        cleanup_loopback_worker(proc)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--role", choices=["loopback", "worker", "coordinator"],
+                   default="loopback")
+    p.add_argument("--bind", default="127.0.0.1:9102")
+    p.add_argument("--worker-host", default="127.0.0.1")
+    p.add_argument("--worker-port", type=int, default=9102)
+    p.add_argument("--rounds", type=int, default=100)
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--dim", type=int, default=1536)
+    p.add_argument("--heads", type=int, default=12)
+    p.add_argument("--head-dim", type=int, default=128)
+    p.add_argument("--batch", type=int, default=2)
+    p.add_argument("--seq", type=int, default=1024)
+    p.add_argument("--qk-norm", choices=["rms", "none"], default="rms")
+    p.add_argument("--rope-theta", type=float, default=10000.0)
+    p.add_argument("--wire-dtype", choices=["fp16", "fp32"], default="fp16")
+    p.add_argument("--weight-seed", type=lambda s: int(s, 0), default=0xC0FFEE)
+    p.add_argument("--threshold", type=float, default=None)
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--inject-fault", default="none",
+                   choices=["none", "flip_v", "scale_o", "drop_softmax",
+                            "drop_rope", "drop_qk_norm"])
+    p.add_argument("--link-gbps", type=float, default=None)
+    p.add_argument("--pipeline", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--json-report", default=None)
+    args = p.parse_args()
+
+    if args.role == "worker":
+        host, port_s = args.bind.split(":")
+        Worker(host, int(port_s), args.device, args.inject_fault,
+               pipeline=args.pipeline, quiet=args.quiet).serve_once()
+        return 0
+    if args.role == "coordinator":
+        return run_coordinator(args.worker_host, args.worker_port, args)
+    if args.role == "loopback":
+        return launch_loopback(args)
+    raise ValueError(f"unknown role: {args.role}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
