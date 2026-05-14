@@ -214,3 +214,36 @@ def test_coordinator_loopback_detects_flip_v_fault():
 
     assert rm.ok is False
     assert rm.mse[m.OP_V] > 1e-2  # well above the 1e-3 threshold
+
+
+import subprocess
+
+
+def test_loopback_subprocess_smoke():
+    """Run the example end-to-end as a subprocess via --role loopback."""
+    out = subprocess.run(
+        [sys.executable, str(EXAMPLE_PATH),
+         "--role", "loopback", "--device", "cpu",
+         "--hidden", "32", "--heads", "4", "--kv-heads", "4",
+         "--head-dim", "8", "--batch", "2", "--seq", "8",
+         "--wire-dtype", "fp32", "--rounds", "5", "--warmup", "1"],
+        capture_output=True, timeout=60, text=True,
+    )
+    assert out.returncode == 0, f"stderr:\n{out.stderr}\nstdout:\n{out.stdout}"
+    assert "rounds passed     4 / 4" in out.stdout
+    assert "End-to-end" in out.stdout
+
+
+def test_loopback_subprocess_fault_detection():
+    out = subprocess.run(
+        [sys.executable, str(EXAMPLE_PATH),
+         "--role", "loopback", "--device", "cpu",
+         "--hidden", "32", "--heads", "4", "--kv-heads", "4",
+         "--head-dim", "8", "--batch", "2", "--seq", "8",
+         "--wire-dtype", "fp32", "--rounds", "3", "--warmup", "0",
+         "--inject-fault", "scale_o"],
+        capture_output=True, timeout=60, text=True,
+    )
+    assert out.returncode == 0
+    # All measured rounds should fail
+    assert "rounds passed     0 / 3" in out.stdout
