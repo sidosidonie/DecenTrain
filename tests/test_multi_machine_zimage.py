@@ -72,3 +72,52 @@ def test_make_block_weights_per_block_unique():
     blocks = m.make_zimage_block_weights(cfg, dtype=torch.float32, device="cpu")
     # Block 0 and block 1 must have DIFFERENT q_proj weights
     assert not torch.equal(blocks[0].q_proj.weight, blocks[1].q_proj.weight)
+
+
+def test_compute_zimage_block_forward_matches_reference():
+    m = _load()
+    cfg = m.ZimageConfig(dim=16, heads=2, head_dim=8, ffn_inter=32,
+                         n_layers=2, batch=1, seq=4, weight_seed=42)
+    blocks = m.make_zimage_block_weights(cfg, torch.float32, "cpu")
+    freqs = m.precompute_zimage_freqs_cis(cfg.head_dim, cfg.seq, theta=cfg.rope_theta)
+
+    torch.manual_seed(0)
+    x_in = torch.randn(cfg.batch, cfg.seq, cfg.dim)
+
+    # Run the worker compute
+    block_outs, x_out = m.compute_zimage_stack_forward(x_in, blocks, freqs, cfg)
+    assert len(block_outs) == cfg.n_layers
+    # Each block_outs[b] is dict with keys OP_Q/OP_K/OP_V/OP_O/OP_W1/OP_W3/OP_W2
+    keys = {m.OP_Q, m.OP_K, m.OP_V, m.OP_O, m.OP_W1, m.OP_W3, m.OP_W2}
+    assert set(block_outs[0].keys()) == keys
+
+    # Reference: re-run block by block using the same compute paths
+    x = x_in
+    for b in range(cfg.n_layers):
+        bw = blocks[b]
+        x_n = m.rmsnorm_cpu(x, bw.attention_norm1, m.ZIMAGE_LAYER_NORM_EPS)
+        # attention sub-block
+        q = bw.q_proj(x_n); k = bw.k_proj(x_n); v = bw.v_proj(x_n)
+        qh = q.unflatten(-1, (cfg.heads, cfg.head_dim))
+        kh = k.unflatten(-1, (cfg.heads, cfg.head_dim))
+        vh = v.unflatten(-1, (cfg.heads, cfg.head_dim))
+        if bw.norm_q is not None:
+            qh = m.rmsnorm_cpu(qh, bw.norm_q, m.ZIMAGE_QK_NORM_EPS)
+            kh = m.rmsnorm_cpu(kh, bw.norm_k, m.ZIMAGE_QK_NORM_EPS)
+        qh = m.apply_rotary_emb_zimage(qh, freqs)
+        kh = m.apply_rotary_emb_zimage(kh, freqs)
+        qt = qh.permute(0, 2, 1, 3); kt = kh.permute(0, 2, 1, 3); vt = vh.permute(0, 2, 1, 3)
+        scores = qt @ kt.transpose(2, 3) * (cfg.head_dim ** -0.5)
+        probs = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)
+        attn_out = (probs @ vt).permute(0, 2, 1, 3).flatten(2, 3)
+        o = bw.o_proj(attn_out)
+        x_after = x + o
+
+        # FFN sub-block
+        h = m.rmsnorm_cpu(x_after, bw.ffn_norm1, m.ZIMAGE_LAYER_NORM_EPS)
+        w1o = bw.w1(h); w3o = bw.w3(h)
+        gated = torch.nn.functional.silu(w1o) * w3o
+        w2o = bw.w2(gated)
+        x = x_after + w2o
+
+    assert torch.allclose(x_out, x, atol=1e-4)

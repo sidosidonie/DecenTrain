@@ -157,3 +157,61 @@ def make_zimage_block_weights(
         )
         blocks.append(bw)
     return blocks
+
+
+# ── N-block forward (worker side) ───────────────────────────────────
+def compute_zimage_block_forward(
+    x_in: torch.Tensor, bw: BlockWeights, freqs_cis: torch.Tensor,
+    cfg: ZimageConfig,
+) -> tuple[dict[int, torch.Tensor], torch.Tensor]:
+    """Run one block forward. Returns (per-op-kind raw outputs, x_out_for_next_block)."""
+    B, S = cfg.batch, cfg.seq
+
+    # Attention sub-block
+    x_norm = rmsnorm_cpu(x_in,
+                         bw.attention_norm1.to(x_in.device),
+                         ZIMAGE_LAYER_NORM_EPS).to(x_in.dtype)
+    q_raw = bw.q_proj(x_norm)
+    k_raw = bw.k_proj(x_norm)
+    v_raw = bw.v_proj(x_norm)
+
+    qh = q_raw.unflatten(-1, (cfg.heads, cfg.head_dim))
+    kh = k_raw.unflatten(-1, (cfg.heads, cfg.head_dim))
+    vh = v_raw.unflatten(-1, (cfg.heads, cfg.head_dim))
+    if bw.norm_q is not None:
+        qh = rmsnorm_cpu(qh, bw.norm_q.to(qh.device), ZIMAGE_QK_NORM_EPS).to(qh.dtype)
+        kh = rmsnorm_cpu(kh, bw.norm_k.to(kh.device), ZIMAGE_QK_NORM_EPS).to(kh.dtype)
+    qh = apply_rotary_emb_zimage(qh, freqs_cis.to(qh.device))
+    kh = apply_rotary_emb_zimage(kh, freqs_cis.to(kh.device))
+    qt = qh.permute(0, 2, 1, 3); kt = kh.permute(0, 2, 1, 3); vt = vh.permute(0, 2, 1, 3)
+    scores = qt @ kt.transpose(2, 3) * (cfg.head_dim ** -0.5)
+    probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)
+    attn_out = (probs @ vt).permute(0, 2, 1, 3).flatten(2, 3)
+    o_raw = bw.o_proj(attn_out)
+    x_after = x_in + o_raw
+
+    # FFN sub-block
+    h = rmsnorm_cpu(x_after,
+                    bw.ffn_norm1.to(x_after.device),
+                    ZIMAGE_LAYER_NORM_EPS).to(x_after.dtype)
+    w1_raw = bw.w1(h)
+    w3_raw = bw.w3(h)
+    gated = F.silu(w1_raw) * w3_raw
+    w2_raw = bw.w2(gated)
+    x_out = x_after + w2_raw
+
+    return {OP_Q: q_raw, OP_K: k_raw, OP_V: v_raw, OP_O: o_raw,
+            OP_W1: w1_raw, OP_W3: w3_raw, OP_W2: w2_raw}, x_out
+
+
+def compute_zimage_stack_forward(
+    x_in: torch.Tensor, blocks: list[BlockWeights],
+    freqs_cis: torch.Tensor, cfg: ZimageConfig,
+) -> tuple[list[dict[int, torch.Tensor]], torch.Tensor]:
+    """Run the full N-block forward. Returns (per-block raw-outputs list, final x)."""
+    block_outs = []
+    x = x_in
+    for b in range(cfg.n_layers):
+        outs, x = compute_zimage_block_forward(x, blocks[b], freqs_cis, cfg)
+        block_outs.append(outs)
+    return block_outs, x
