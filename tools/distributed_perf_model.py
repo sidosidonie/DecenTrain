@@ -139,6 +139,36 @@ NETWORKS = {
     "200GbE-IB": NetworkSpec("200 GbE IB-HDR", bandwidth_gbps=200, latency_us=2),
     "400GbE-IB": NetworkSpec("400 GbE IB-NDR", bandwidth_gbps=400, latency_us=1),
     "local-PCIe": NetworkSpec("Local PCIe", bandwidth_gbps=256, latency_us=0),
+
+    # ── Measured on GCP us-central1-a, 2026-05-14 ──
+    # Setup: c3-standard-44 (44 vCPU, gVNIC, NIC link 32 Gb/s) coord ↔
+    # g2-standard-8 (8 vCPU, L4 GPU) worker. Intra-zone, no Tier_1.
+    # iperf3 over TCP, 32 parallel streams to find the per-link cap.
+    #
+    # Effective per-VM egress is the bottleneck for these flows; ingress
+    # is not VM-capped on GCP (only the receiver's NIC ceiling matters).
+    # So a "link" name here is named after the *sender*'s VM family.
+    "GCP-g2-default": NetworkSpec(
+        # g2 (and other GPU instances) are not Tier_1-capable; their
+        # sustained per-VM egress caps at ~10 Gb/s no matter the vCPU
+        # count. Single TCP stream measured 9.66 Gb/s; 32 streams
+        # aggregate 9.74 Gb/s — same ceiling, no scaling with N.
+        "GCP g2 worker → coord (intra-zone, no Tier_1)",
+        bandwidth_gbps=9.7, latency_us=100),
+    "GCP-c3-default": NetworkSpec(
+        # c3-standard-44 default (no Tier_1): NIC link is 32 Gb/s
+        # (gVNIC, ethtool-confirmed). Measured 27.2 Gb/s sustained
+        # egress from coord → worker with 32 streams (≈85% of NIC).
+        # Ingress is uncapped at the VM level, so the same NIC ceiling
+        # applies to the receive side.
+        "GCP c3-standard-44 (default, gVNIC 32 Gb/s NIC)",
+        bandwidth_gbps=32, latency_us=100),
+    "GCP-c3-tier1": NetworkSpec(
+        # c3-standard-44 with Tier_1 networking enabled (free flag,
+        # gVNIC + 30+ vCPU required, no extra cost). Per GCP spec the
+        # NIC ceiling rises to ~100 Gb/s for this size.
+        "GCP c3-standard-44 + Tier_1 networking",
+        bandwidth_gbps=100, latency_us=100),
 }
 
 
@@ -587,7 +617,9 @@ def run_bandwidth_sweep():
         cpu = CPUS["EPYC-9654"]
         gpu = GPUS["H100-SXM"]
         num_gpus = max(1, math.ceil(model.param_bytes / (gpu.memory_gb * 1e9 * 0.85)))
-        for net_name in ["1GbE", "10GbE", "25GbE", "100GbE", "200GbE-IB", "local-PCIe"]:
+        for net_name in ["1GbE", "GCP-g2-default", "10GbE", "25GbE",
+                          "GCP-c3-default", "100GbE", "GCP-c3-tier1",
+                          "200GbE-IB", "local-PCIe"]:
             net = NETWORKS[net_name]
             vp = VerifyParams(freivalds_k=10, verify_every_n=1, max_workers=64,
                               use_slalom=True, compression="fp16", tee_overhead_pct=3)
