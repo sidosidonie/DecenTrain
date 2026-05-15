@@ -117,6 +117,14 @@ L4 fp16 ~120 TFLOPS、A100 fp16 ~312 TFLOPS、H100 fp16 ~990 TFLOPS。理论：
 
 实测 ~2 ms 都比理论高一个数量级，原因是 batch=1 seq=512 太小，**kernel launch + RoPE + softmax 的固定开销占主导**，不是算力 bound。
 
+> **注：上述 GPU forward 不含 D2H (GPU→CPU) 传输时间。** worker 代码里 `gpu_t_ms`
+> 在 `cuda.synchronize()` 后立即截止，D2H 发生在后续 `pack_tensor` 的 `.cpu()` 调用
+> 中，被隐式算进了 coord 端测的 `wire_recv_t` 里。L4 PCIe 4.0 x16 实际 ~25 GB/s，
+> 4 MiB tensor D2H ≈ **160 µs**，4 个 tensor 共 **~0.6 ms**（attn mode A）/ ~0.8 ms
+> （mode B 含 scores）。pipeline 模式下主线程的 D2H 还能跟 sender 线程的 TCP send
+> overlap，对端到端基本零影响。在 wire ≥ 100 Gb/s 的高带宽场景下 D2H 占比上升到
+> 5-10%，但此时 GPU forward 也成主导，整体精度仍可接受。
+
 ---
 
 ## 4. 不同带宽下的理论传输时间
