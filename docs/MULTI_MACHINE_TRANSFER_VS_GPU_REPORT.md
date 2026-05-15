@@ -296,7 +296,11 @@ L4 fp16 ~120 TFLOPS、A100 fp16 ~312 TFLOPS、H100 fp16 ~990 TFLOPS。理论：
 - **GCP c3 + Tier_1 (100 Gb/s)**: attn-A 接近平衡、FFN 刚好平、**attn-B 仍 1.3× network-bound**
 - **本地 PCIe (256 Gb/s)**: 全部 GPU 主导
 
-### 7.4 实际优化方向
+### 7.4 实际优化方向（先看）
+
+> 完整模型规模的估算见 [§8](#8-整模型估算perf-model)。下面是单层结论。
+
+
 
 按收益从大到小：
 
@@ -307,3 +311,81 @@ L4 fp16 ~120 TFLOPS、A100 fp16 ~312 TFLOPS、H100 fp16 ~990 TFLOPS。理论：
 5. **coord verify 移到 GPU**（如果 coord 有 GPU）—— SLALOM matmul GPU 化
 
 GPU 端、协议帧头、SLALOM 算法本身**都不值得优化**，全在网络这一侧。
+
+---
+
+## 8. 整模型估算（perf model）
+
+前面 §1-§7 都是**单层**（attn-llama 一个 attention layer 或 FFN 一个 SwiGLU MLP）的对比。
+真实 LLM 推理是几十层串行/并行 verify，所以聚合 wire 量级线性放大。
+
+下表用 `tools/distributed_perf_model.py` 的 `estimate_transfer_bytes()` 估各模型整 fwd
+所需的 wire 字节，并按 §4 的网络档计算理论传输时间。**注意** perf model 计算的是
+"with-scores + attn_out 都传"的最防御模式（每 attn layer 7 个 tensor: x + q + k + v +
+scores + attn_out + o; 每 MLP 4 个: x + gate + up + down），**比当前 attn-llama mode A
+实际传的还多**。要折算到 mode A 大约 ÷2，到 mode B 大约 ÷1.4。
+
+### 8.1 各模型单 fwd 传输总量（B=1, S=512, fp16）
+
+| Model | hidden | inter | layers | verified attn | verified MLP | **wire / fwd** | wire / layer |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 896 | 4864 | 24 | 24 | 24 | **553.6 MB** | 23.07 MB |
+| Llama-3.2-1B | 2048 | 8192 | 16 | 16 | 16 | **755.0 MB** | 47.19 MB |
+| Qwen3.5-9B | 4096 | 12288 | 32 | 8 | 32 | **1359.0 MB** | 42.47 MB |
+| Llama-3-70B | 8192 | 28672 | 80 | 80 | 80 | **11576.3 MB** | 144.70 MB |
+| Qwen2.5-72B | 8192 | 29568 | 80 | 80 | 80 | **11723.1 MB** | 146.54 MB |
+
+观察：
+- **Qwen3.5-9B verify 配置不一样**（只 verify 8 个 attn layer 而非全部 32），所以 wire/fwd 远小于 Llama-3.2-1B 的"hidden=2048 全 verify"
+- **70B class 单 fwd 11.7 GB**，是 Qwen-0.5B 的 21×
+
+### 8.2 各网络下整 fwd 理论传输时间
+
+| Model | GCP-g2 (9.7G) | 10GbE | 25GbE | GCP-c3 (32G) | 100GbE | Tier_1 (100G) | 200GbE-IB | 400GbE-IB | local-PCIe |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 456.6 ms | 442.9 | 177.2 | 138.4 | 44.3 | 44.3 | 22.1 | 11.1 | 17.3 |
+| Llama-3.2-1B | 622.7 ms | 604.0 | 241.6 | 188.7 | 60.4 | 60.4 | 30.2 | 15.1 | 23.6 |
+| Qwen3.5-9B | **1.12 s** | 1.09 s | 434.9 | 339.7 | 108.7 | 108.7 | 54.4 | 27.2 | 42.5 |
+| Llama-3-70B | **9.55 s** | 9.26 s | 3.70 s | 2.89 s | 926.1 | 926.1 | 463.1 | 231.5 | 361.8 |
+| Qwen2.5-72B | **9.67 s** | 9.38 s | 3.75 s | 2.93 s | 937.8 | 937.8 | 468.9 | 234.5 | 366.3 |
+
+→ **70B 在 GCP-g2 默认网络下，单 fwd 要 ~10 秒**，完全不可用。要落地必须升 Tier_1（~1 s/fwd）或多机分发。
+
+### 8.3 理论 tok/s 上限（network-bound only，忽略 GPU + verify）
+
+= `(1000ms / fwd_transfer_ms) × seq_len`，相当于"如果只受 wire 字节量限制"的天花板：
+
+| Model | GCP-g2 | 10GbE | 25GbE | GCP-c3 (32G) | 100GbE | Tier_1 | 200GbE-IB | 400GbE-IB | PCIe |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 1.1k | 1.2k | 2.9k | 3.7k | **11.6k** | 11.6k | 23.1k | 46.2k | 29.6k |
+| Llama-3.2-1B | 822 | 848 | 2.1k | 2.7k | 8.5k | 8.5k | 17.0k | 33.9k | 21.7k |
+| Qwen3.5-9B | 457 | 471 | 1.2k | 1.5k | 4.7k | 4.7k | 9.4k | 18.8k | 12.1k |
+| **Llama-3-70B** | **54** | 55 | 138 | 177 | 553 | 553 | **1.1k** | 2.2k | 1.4k |
+| Qwen2.5-72B | 53 | 55 | 136 | 175 | 546 | 546 | 1.1k | 2.2k | 1.4k |
+
+→ **GCP 默认网络上 70B 只有 54 tok/s 上限**（实测会更低，因为 CPU/Python 还会再打 30% 折）。
+要做实用 70B verified inference，最低门槛是 **Tier_1 + 多 worker 分散**。
+
+### 8.4 折算到当前 attn-llama mode A 实际场景
+
+perf model 是 worst-case（mode B+），实际 attn-llama mode A 单 attn layer 只传 16.78 MB
+（H=4096 S=512），跟模型估算的 ~42 MB/layer 相比是 **0.4×**。所以上面表里 attn 部分实际
+wire 会比这低 ~60%。FFN 部分基本一致（mode A 已经传了 x + gate + up + down 等价物）。
+
+按 mode A 折算 Qwen3.5-9B（attn-mostly 8 层 + 32 MLP），实际 wire ≈ 1359 × 0.7 ≈ 950 MB/fwd，
+GCP-g2 单 fwd ≈ 780 ms，理论 tok/s 上限 ≈ 660（vs 表里 457）。其他模型类似比例。
+
+### 8.5 复现命令
+
+```bash
+python3 - <<'PY'
+import sys; sys.path.insert(0, 'tools')
+from distributed_perf_model import MODELS, NETWORKS, estimate_transfer_bytes
+for name, m in MODELS.items():
+    b = estimate_transfer_bytes(m, batch=1, seq_len=512, compression="fp16")
+    print(f"{name:<16} {b/1e6:>9.1f} MB/fwd")
+    for n_name, n in NETWORKS.items():
+        t_ms = b * 8 / (n.bandwidth_gbps * 1e9) * 1000
+        print(f"  {n_name:<22}: {t_ms:>10.1f} ms / fwd  ({1000/t_ms*512:>8.0f} tok/s ceiling)")
+PY
+```
