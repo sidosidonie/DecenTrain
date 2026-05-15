@@ -56,7 +56,8 @@ OP_Q = 1
 OP_K = 2
 OP_V = 3
 OP_O = 4
-_OP_NAME = {OP_Q: "q", OP_K: "k", OP_V: "v", OP_O: "o"}
+OP_SCORES = 5  # post-RoPE qk^T scores; only sent when --send-scores is on
+_OP_NAME = {OP_Q: "q", OP_K: "k", OP_V: "v", OP_O: "o", OP_SCORES: "scores"}
 
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -133,11 +134,18 @@ def compute_attn_forward(
     x: torch.Tensor,
     q_proj: nn.Linear, k_proj: nn.Linear, v_proj: nn.Linear, o_proj: nn.Linear,
     cos: torch.Tensor, sin: torch.Tensor, cfg: AttnLlamaConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the full attention forward and return (q_raw, k_raw, v_raw, output).
+    return_scores: bool = False,
+):
+    """Run the full attention forward.
 
-    Only the "raw" linear outputs cross the wire — `attn_out` is recomputed
-    on the coordinator from the verified q/k/v.
+    Returns (q_raw, k_raw, v_raw, output) by default. With return_scores=True
+    also returns the post-RoPE qk^T tensor (pre-causal-mask, pre-softmax) as
+    a 5th element, shape [B, heads, S, S].
+
+    "Raw" linear outputs cross the wire; attn_out is recomputed on the
+    coordinator from the verified q/k/v. Optionally the qk^T scores are also
+    transmitted so the coordinator can verify them directly instead of
+    recomputing the qk^T matmul.
     """
     B, S = cfg.batch, cfg.seq
     q_raw = q_proj(x)
@@ -153,11 +161,13 @@ def compute_attn_forward(
     v = repeat_kv(v, cfg.num_kv_groups)
 
     scale = cfg.head_dim ** -0.5
-    scores = q @ k.transpose(-2, -1) * scale
-    scores = scores + causal_mask(S, scores.device, scores.dtype)
+    scores_raw = q @ k.transpose(-2, -1) * scale  # pre-mask, pre-softmax
+    scores = scores_raw + causal_mask(S, scores_raw.device, scores_raw.dtype)
     probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)
     attn_out = (probs @ v).transpose(1, 2).contiguous().reshape(B, S, cfg.hidden)
     output = o_proj(attn_out)
+    if return_scores:
+        return q_raw, k_raw, v_raw, output, scores_raw
     return q_raw, k_raw, v_raw, output
 
 
@@ -218,13 +228,14 @@ class Worker:
 
     def __init__(self, bind_host: str, bind_port: int, device: str,
                  inject_fault: str = "none", pipeline: bool = False,
-                 quiet: bool = False):
+                 quiet: bool = False, send_scores: bool = False):
         self.bind_host = bind_host
         self.bind_port = bind_port
         self.device = torch.device(device)
         self.inject_fault = inject_fault
         self.pipeline = pipeline
         self.quiet = quiet
+        self.send_scores = send_scores
         self.q_proj = self.k_proj = self.v_proj = self.o_proj = None
         self.hidden = self.heads = self.kv_heads = self.head_dim = 0
         self.rope_base = 0.0
@@ -324,9 +335,15 @@ class Worker:
         x = x_cpu.to(device=self.device, dtype=self.compute_dtype)
 
         t0 = time.perf_counter()
-        q_raw, k_raw, v_raw, output = compute_attn_forward(
-            x, self.q_proj, self.k_proj, self.v_proj, self.o_proj,
-            cos, sin, cfg)
+        scores = None
+        if self.send_scores:
+            q_raw, k_raw, v_raw, output, scores = compute_attn_forward(
+                x, self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+                cos, sin, cfg, return_scores=True)
+        else:
+            q_raw, k_raw, v_raw, output = compute_attn_forward(
+                x, self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+                cos, sin, cfg)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         gpu_t_ms = (time.perf_counter() - t0) * 1000.0
@@ -336,25 +353,35 @@ class Worker:
 
         if self.pipeline:
             self._send_pipelined(sock, request_id,
-                                 q_raw, k_raw, v_raw, output, gpu_t_ms)
+                                 q_raw, k_raw, v_raw, output, gpu_t_ms,
+                                 scores=scores)
         else:
             for tag, t in ((OP_Q, q_raw), (OP_K, k_raw),
                            (OP_V, v_raw), (OP_O, output)):
                 send_msg(sock, MSG_TENSOR,
                          pack_tensor(request_id, tag, t, self.wire_dtype_id))
+            if scores is not None:
+                send_msg(sock, MSG_TENSOR,
+                         pack_tensor(request_id, OP_SCORES, scores,
+                                     self.wire_dtype_id))
             send_msg(sock, MSG_FORWARD_DONE,
                      pack_forward_done(request_id, gpu_t_ms))
 
         self._round_count += 1
-        sent_mb = sum(t.numel() for t in (q_raw, k_raw, v_raw, output)) \
+        sent_tensors = [q_raw, k_raw, v_raw, output]
+        if scores is not None:
+            sent_tensors.append(scores)
+        sent_mb = sum(t.numel() for t in sent_tensors) \
                   * _DTYPE_SIZE[self.wire_dtype_id] / 1e6
         fault = f"  [INJECTED FAULT: {self.inject_fault}]" if self.inject_fault != "none" else ""
         mode = "pipelined" if self.pipeline else "sequential"
+        scores_note = "  +scores" if scores is not None else ""
         self._log(f"round #{self._round_count} (req {request_id}): "
                   f"x[{B},{S},{self.hidden}] → forward {gpu_t_ms:.2f} ms on "
-                  f"{self.device.type}, sent {sent_mb:.2f} MB ({mode}){fault}")
+                  f"{self.device.type}, sent {sent_mb:.2f} MB ({mode}{scores_note}){fault}")
 
-    def _send_pipelined(self, sock, request_id, q, k, v, o, gpu_t_ms) -> None:
+    def _send_pipelined(self, sock, request_id, q, k, v, o, gpu_t_ms,
+                         scores: Optional[torch.Tensor] = None) -> None:
         send_q: queue.Queue = queue.Queue()
         sender_exc: list = []
 
@@ -374,6 +401,10 @@ class Worker:
         for tag, ten in ((OP_Q, q), (OP_K, k), (OP_V, v), (OP_O, o)):
             send_q.put((MSG_TENSOR,
                         pack_tensor(request_id, tag, ten, self.wire_dtype_id)))
+        if scores is not None:
+            send_q.put((MSG_TENSOR,
+                        pack_tensor(request_id, OP_SCORES, scores,
+                                    self.wire_dtype_id)))
         send_q.put((MSG_FORWARD_DONE, pack_forward_done(request_id, gpu_t_ms)))
         send_q.put(None)
         t.join()
@@ -421,8 +452,17 @@ class Coordinator:
 
     def __init__(self, host: str, port: int, config: AttnLlamaConfig,
                  threshold: float, k: int = SLALOM_K, pipeline: bool = False,
-                 o_threshold: Optional[float] = None):
+                 o_threshold: Optional[float] = None,
+                 verify_scores: bool = False,
+                 scores_threshold: Optional[float] = None):
         self.host = host
+        self.verify_scores = verify_scores
+        # qk^T values can range widely (head_dim**0.5 ≈ 11 for hd=128 means
+        # raw dot products can be O(10) magnitude); fp16 compression noise
+        # roughly sqrt(head_dim) larger than per-element. A threshold ~10x
+        # the SLALOM threshold is conservative for the recompute-and-compare.
+        self.scores_threshold = (scores_threshold if scores_threshold is not None
+                                  else max(threshold * 10, 1e-2))
         self.port = port
         self.config = config
         self.threshold = threshold
@@ -488,10 +528,11 @@ class Coordinator:
                            self.config.hidden, dtype=torch.float32, generator=gen)
 
     def predicted_recv_bytes(self) -> int:
-        # 4 TENSOR + 1 FORWARD_DONE
+        # 4 TENSOR + 1 FORWARD_DONE  (+1 TENSOR if verify_scores)
         frame_hdr = 8
-        # tensor body header = struct.calcsize("<QHBB") + ndim*4 (3 dims)
-        tensor_body_hdr = struct.calcsize("<QHBB") + 4 * 3
+        # 3-D tensor body header = struct.calcsize("<QHBB") + ndim*4 (3 dims)
+        tensor_body_hdr_3d = struct.calcsize("<QHBB") + 4 * 3
+        tensor_body_hdr_4d = struct.calcsize("<QHBB") + 4 * 4
         done_body = struct.calcsize("<Qd")
         ds = _DTYPE_SIZE[self.config.wire_dtype]
         cfg = self.config
@@ -499,8 +540,12 @@ class Coordinator:
         bytes_k = cfg.batch * cfg.seq * cfg.kv_heads * cfg.head_dim * ds
         bytes_v = bytes_k
         bytes_o = cfg.batch * cfg.seq * cfg.hidden * ds
-        return (4 * (frame_hdr + tensor_body_hdr) + (frame_hdr + done_body)
-                + bytes_q + bytes_k + bytes_v + bytes_o)
+        total = (4 * (frame_hdr + tensor_body_hdr_3d) + (frame_hdr + done_body)
+                 + bytes_q + bytes_k + bytes_v + bytes_o)
+        if self.verify_scores:
+            bytes_scores = cfg.batch * cfg.heads * cfg.seq * cfg.seq * ds
+            total += (frame_hdr + tensor_body_hdr_4d) + bytes_scores
+        return total
 
     def _expected_shape(self, op_tag: int) -> tuple:
         cfg = self.config
@@ -510,6 +555,9 @@ class Coordinator:
             return (cfg.batch, cfg.seq, cfg.kv_heads * cfg.head_dim)
         if op_tag == OP_O:
             return (cfg.batch, cfg.seq, cfg.hidden)
+        if op_tag == OP_SCORES:
+            # post-RoPE qk^T, post-GQA repeat_kv (so heads dim, not kv_heads)
+            return (cfg.batch, cfg.heads, cfg.seq, cfg.seq)
         raise WireProtocolError(f"unknown op_tag {op_tag}")
 
     def _recompute_attn_cpu(
@@ -562,7 +610,8 @@ class Coordinator:
         first_submit_t: Optional[float] = None
         gpu_t = 0.0
         done = False
-        while not done or len(acts) < 4:
+        expected_tensor_count = 5 if self.verify_scores else 4
+        while not done or len(acts) < expected_tensor_count:
             mt, body = recv_msg(self.sock)
             bytes_recv += 8 + len(body)
             if mt == MSG_TENSOR:
@@ -649,14 +698,39 @@ class Coordinator:
                 slalom_verify_safe, attn_out_cpu, acts[OP_O], self.s_o, self.s_tilde_o)
             rm.cpu_verify_t = (time.perf_counter() - t_v_start) * 1000.0
 
+        if self.verify_scores:
+            # Recompute the post-RoPE qk^T on CPU from the verified q/k and
+            # MSE-compare to the received scores. This is a correctness check
+            # only -- it does not save the qk^T compute (we still recompute
+            # to verify). A proper Freivalds check would skip the recompute.
+            rm.mse[OP_SCORES], rm.cpu_verify_per_op_t[OP_SCORES] = self._timed(
+                self._verify_scores_recompute,
+                acts[OP_Q], acts[OP_K], acts[OP_SCORES])
+
         rm.end_to_end_t = (time.perf_counter() - t_start) * 1000.0
         rm.ok = (
             rm.mse[OP_Q] <= self.threshold and
             rm.mse[OP_K] <= self.threshold and
             rm.mse[OP_V] <= self.threshold and
-            rm.mse[OP_O] <= self.o_threshold
+            rm.mse[OP_O] <= self.o_threshold and
+            (not self.verify_scores
+             or rm.mse[OP_SCORES] <= self.scores_threshold)
         )
         return rm
+
+    def _verify_scores_recompute(
+        self, q_cpu: torch.Tensor, k_cpu: torch.Tensor,
+        scores_received: torch.Tensor,
+    ) -> float:
+        """Recompute post-RoPE qk^T on CPU from q/k, MSE-compare to received."""
+        cfg = self.config
+        cos, sin = self._get_rope_cpu(cfg.seq)
+        q = q_cpu.view(cfg.batch, cfg.seq, cfg.heads, cfg.head_dim).transpose(1, 2)
+        k = k_cpu.view(cfg.batch, cfg.seq, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
+        q, k = apply_rope_llama(q, k, cos, sin)
+        k = repeat_kv(k, cfg.num_kv_groups)
+        scores_expected = q @ k.transpose(-2, -1) * (cfg.head_dim ** -0.5)
+        return ((scores_received - scores_expected) ** 2).mean().item()
 
     def run_many(self, rounds: int, *, input_seed_start: int = 1_000_000) -> list:
         return [self.run_round(i, input_seed_start + i) for i in range(rounds)]
@@ -678,7 +752,8 @@ def run_coordinator(host: str, port: int, args) -> int:
         cfg.wire_dtype, cfg.hidden, fp16_slope=4e-6)
     coord = Coordinator(host=host, port=port, config=cfg,
                         threshold=threshold, k=SLALOM_K,
-                        pipeline=args.pipeline, o_threshold=o_threshold)
+                        pipeline=args.pipeline, o_threshold=o_threshold,
+                        verify_scores=args.send_scores)
     try:
         coord.connect_and_load()
         rounds = coord.run_many(rounds=args.rounds)
@@ -710,7 +785,8 @@ def run_coordinator(host: str, port: int, args) -> int:
 def launch_loopback(args) -> int:
     proc, port = launch_loopback_worker(
         __file__, extra_worker_argv=["--inject-fault", args.inject_fault]
-                  + (["--pipeline"] if args.pipeline else []),
+                  + (["--pipeline"] if args.pipeline else [])
+                  + (["--send-scores"] if args.send_scores else []),
         device=args.device,
     )
     try:
@@ -746,12 +822,17 @@ def main() -> int:
     p.add_argument("--link-gbps", type=float, default=None)
     p.add_argument("--pipeline", action="store_true")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--send-scores", action="store_true",
+                   help="Worker also transmits the post-RoPE qk^T tensor "
+                        "([B, heads, S, S]); coordinator verifies it by "
+                        "recompute-and-compare. Both ends must agree.")
     args = p.parse_args()
 
     if args.role == "worker":
         host, port_s = args.bind.split(":")
         Worker(host, int(port_s), args.device, args.inject_fault,
-               pipeline=args.pipeline, quiet=args.quiet).serve_once()
+               pipeline=args.pipeline, quiet=args.quiet,
+               send_scores=args.send_scores).serve_once()
         return 0
     if args.role == "coordinator":
         return run_coordinator(args.worker_host, args.worker_port, args)
